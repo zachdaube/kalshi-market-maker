@@ -1,0 +1,55 @@
+# Kalshi Market Maker Configuration Example
+# Copy this to config.yaml and fill in your values
+
+api:
+  # Use "demo" for testing, "production" for real trading
+  environment: demo
+
+  # Demo API settings
+  demo:
+    host: https://demo-api.kalshi.co/trade-api/v2
+    key_id: your-demo-key-id-here
+    key_path: kalshidemo.txt
+
+  # Production API settings (CAREFUL - REAL MONEY!)
+  production:
+    host: https://api.elections.kalshi.com/trade-api/v2
+    key_id: your-production-key-id-here
+    key_path: zachdaube.txt
+
+market:
+  # Which market to trade (or leave empty to scan)
+  ticker: ""
+
+  # How often to poll for updates (seconds)
+  poll_interval_seconds: 1.0
+
+quotes:
+  # How wide to quote around mid (in cents)
+  half_spread_cents: 3
+
+  # Minimum profitable spread (in cents)
+  min_spread_cents: 5
+
+  # Default order size (contracts)
+  default_quantity: 50
+
+position:
+  # Maximum position in contracts
+  max_contracts: 200
+
+  # Maximum position in dollars
+  max_dollars: 100
+
+  # How aggressively to skew quotes when positioned (0-1)
+  skew_factor: 0.5
+
+risk:
+  # Stop trading if loss exceeds this (dollars)
+  max_loss_dollars: 50
+
+  # Number of consecutive same-direction trades before pulling quotes
+  toxic_flow_threshold: 4
+
+  # How long to wait after detecting toxic flow (seconds)
+  cooldown_seconds: 30
