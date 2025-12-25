@@ -67,6 +67,8 @@ class OrderBook:
 
     def _parse_bids(self, bid_list: List[List[int]]) -> List[Quote]:
         """Convert list of [price, quantity] to Quote objects."""
+        if bid_list is None:
+            return []
         return [Quote(price=b[0], quantity=b[1]) for b in bid_list if len(b) >= 2]
 
     def _convert_no_bids_to_yes_asks(self, no_bids: List[Quote]) -> List[Quote]:

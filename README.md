@@ -25,8 +25,15 @@ A sophisticated market making bot for Kalshi prediction markets that provides tw
 - Market evaluation logic (should_quote_market)
 - ROI and per-contract profit metrics
 
+**Phase 4: Complete ✅** - Quote Generation
+- Optimal bid/ask quote generation centered on fair value
+- Inventory skewing (adjust quotes based on position)
+- Position tracking with average entry price and P&L
+- Quote sizing based on risk limits
+- Kalshi order format conversion (YES bid + NO bid)
+- Real market making script that actually places orders
+
 **Coming Next:**
-- Phase 4: Quote Generation
 - Phase 5: Flow Detection & Toxic Flow Protection
 - Phase 6: Execution Engine
 - Phase 7: Configuration & Deployment
@@ -69,7 +76,13 @@ python phase2_test.py
 # Phase 3: Fee calculations and profitability
 python phase3_test.py
 
-# Run all unit tests
+# Phase 4: Quote generation and position tracking
+python phase4_test.py
+
+# Real market maker (dry-run mode)
+python simple_market_maker.py
+
+# Run all unit tests (79 tests)
 pytest tests/ -v
 ```
 
@@ -89,16 +102,19 @@ kalshiproject/
 │   ├── __init__.py
 │   ├── client.py           # Kalshi API wrapper (371 lines)
 │   ├── orderbook.py        # Order book processing (290 lines)
-│   └── fees.py             # Fee calculations & profitability (580 lines)
+│   ├── fees.py             # Fee calculations & profitability (580 lines)
+│   └── quotes.py           # Quote generation & position tracking (491 lines)
 │
-├── tests/                  # Unit tests (53 tests, all passing)
+├── tests/                  # Unit tests (79 tests, all passing)
 │   ├── test_orderbook.py   # Order book tests (18 tests)
-│   └── test_fees.py        # Fee calculation tests (35 tests)
+│   ├── test_fees.py        # Fee calculation tests (35 tests)
+│   └── test_quotes.py      # Quote generation tests (26 tests)
 │
 ├── docs/                   # Documentation
 │   ├── PHASE1_SUMMARY.md   # API Foundation
 │   ├── PHASE2_SUMMARY.md   # Order Book Processing
 │   ├── PHASE3_SUMMARY.md   # Fee Economics
+│   ├── PHASE4_SUMMARY.md   # Quote Generation
 │   ├── KALSHI_MECHANICS.md # How Kalshi markets work
 │   ├── ORDERBOOK_FIX.md    # SDK bug workaround
 │   ├── API_DECISIONS.md    # REST vs WebSocket, sync vs async
@@ -111,6 +127,8 @@ kalshiproject/
 ├── phase1_test.py          # API & orderbook demo
 ├── phase2_test.py          # Order book processing demo
 ├── phase3_test.py          # Fee economics demo
+├── phase4_test.py          # Quote generation demo
+├── simple_market_maker.py  # REAL market maker (places orders!)
 ├── test_order_placement.py # Real order placement test
 ├── place_demo_orders.py    # Place live orders (no cancel)
 │
@@ -119,7 +137,7 @@ kalshiproject/
 └── README.md               # This file
 ```
 
-**Lines of Code**: ~1,650 (src/) + ~850 (tests/) = 2,500+ lines
+**Lines of Code**: ~2,140 (src/) + ~1,400 (tests/) = 3,500+ lines
 
 ## 🔑 Key Features
 
@@ -145,6 +163,17 @@ kalshiproject/
 - **Spread Requirements**: Calculate minimum spread to break even or hit target profit
 - **Market Evaluation**: Automated decision whether to quote a market
 - **Critical Insight**: 2¢ spread profitable as maker, but unprofitable as taker!
+
+### Phase 4: Quote Generation
+
+- **Optimal Quoting**: Generate bid/ask quotes centered on fair value (mid price)
+- **Inventory Skewing**: Adjust quotes based on position to manage risk
+  - Long position → skew DOWN to encourage selling
+  - Short position → skew UP to encourage buying
+- **Position Tracking**: Maintain average entry price and unrealized P&L
+- **Quote Sizing**: Adjust contract quantities based on position limits
+- **Kalshi Conversion**: Convert quotes to Kalshi's order format (YES bid + NO bid)
+- **Real Market Maker**: Simple script that actually places orders on Kalshi
 
 ### Understanding Kalshi's Order Book
 
@@ -197,6 +226,7 @@ credentials.yaml
 - **[Phase 1: API Foundation](docs/PHASE1_SUMMARY.md)** - Authentication, orderbooks, API usage, SDK bug fix
 - **[Phase 2: Order Book Processing](docs/PHASE2_SUMMARY.md)** - NO→YES conversion, VWAP, depth analysis, 18 tests
 - **[Phase 3: Fee Economics](docs/PHASE3_SUMMARY.md)** - Fee calculations, profitability, minimum spreads, 35 tests
+- **[Phase 4: Quote Generation](docs/PHASE4_SUMMARY.md)** - Optimal quoting, inventory skewing, position tracking, 26 tests
 
 ### Technical Guides
 - **[Kalshi Mechanics](docs/KALSHI_MECHANICS.md)** - Why YES + NO > $1, position equivalence, market making strategy
@@ -214,7 +244,7 @@ credentials.yaml
 ```python
 from src.client import KalshiClient
 from src.orderbook import OrderBook
-from src.fees import should_quote_market
+from src.quotes import QuoteGenerator, QuoteParams, Position
 
 # Initialize client
 client = KalshiClient(
@@ -232,20 +262,30 @@ raw_ob = client.get_orderbook(ticker, depth=10)
 ob = OrderBook(ticker, raw_ob)
 print(f"Spread: {ob.spread}¢, Mid: {ob.mid_price}¢")
 
-# Evaluate profitability
-result = should_quote_market(
-    spread_cents=ob.spread,
-    contracts=100,
-    mid_price_cents=int(ob.mid_price),
-    min_profit_cents=25,
-    as_maker=True
+# Configure quote generator
+params = QuoteParams(
+    min_spread_cents=2,
+    target_spread_cents=3,
+    base_size=10,
+    max_position=100,
+    skew_enabled=True,
+    min_profit_cents=5
 )
 
-if result['should_quote']:
-    print(f"✅ Quote: {result['recommended_bid']}¢ / {result['recommended_ask']}¢")
-    print(f"   Expected profit: {result['analysis'].net_profit_cents:.2f}¢")
+# Generate quote (with flat position)
+generator = QuoteGenerator(params)
+quote = generator.generate_quote(ob, position=None)
+
+if quote:
+    print(f"✅ Quote: {quote.bid.price_cents}¢ / {quote.ask.price_cents}¢")
+    print(f"   Size: {quote.bid.quantity} contracts")
+    print(f"   Expected profit: {quote.expected_profit_cents:.2f}¢")
+
+    # Convert to Kalshi orders
+    yes_bid, no_bid = quote.to_kalshi_orders()
+    # Place orders using client.place_order(...)
 else:
-    print(f"❌ Skip: {result['reason']}")
+    print(f"❌ Market not quotable")
 ```
 
 ### Running Tests
@@ -262,6 +302,11 @@ pytest tests/test_orderbook.py -v
 python phase1_test.py  # API connection
 python phase2_test.py  # Order book processing
 python phase3_test.py  # Fee economics
+python phase4_test.py  # Quote generation
+
+# Real market maker
+python simple_market_maker.py         # Dry-run mode (safe)
+python simple_market_maker.py --live  # Live mode (places real orders!)
 ```
 
 ## 🎓 Learning Resources
@@ -299,9 +344,9 @@ The official SDK has a validation bug in the orderbook endpoint. Our client bypa
 - [x] **Phase 1: API Foundation** - Authentication, market data, orderbooks, order management
 - [x] **Phase 2: Order Book Processing** - NO→YES conversion, VWAP, depth analysis
 - [x] **Phase 3: Fee Economics** - Fee calculations, profitability, minimum spreads
-- [ ] **Phase 4: Quote Generation** - Optimal pricing, inventory management, quote sizing
+- [x] **Phase 4: Quote Generation** - Optimal pricing, inventory skewing, position tracking, quote sizing
 - [ ] **Phase 5: Flow Detection** - Toxic flow detection, adverse selection protection
-- [ ] **Phase 6: Execution Engine** - Order placement, position tracking, risk limits
+- [ ] **Phase 6: Execution Engine** - Active order management, real-time position sync, multi-market quoting
 - [ ] **Phase 7: Configuration & Deployment** - Config system, logging, monitoring, deployment
 
 ## 🤝 Contributing
