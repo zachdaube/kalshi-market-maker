@@ -4,16 +4,28 @@ A sophisticated market making bot for Kalshi prediction markets that provides tw
 
 ## 🎯 Project Status
 
-**Phase 1: Complete ✅**
-- Authenticated API connection
-- Market data retrieval
+**Phase 1: Complete ✅** - API Foundation
+- Authenticated API connection via RSA keys
+- Market data retrieval and filtering
 - Full orderbook depth (with SDK bug workaround)
-- Order management
-- Portfolio tracking
+- Order management (place, cancel, track)
+- Portfolio tracking and balance queries
+
+**Phase 2: Complete ✅** - Order Book Processing
+- NO bid → YES ask conversion (100 - X formula)
+- Best bid/ask, mid price, spread calculations
+- VWAP (Volume-Weighted Average Price) analysis
+- Depth analysis and cumulative liquidity tracking
+- Edge case handling (empty, crossed, one-sided markets)
+
+**Phase 3: Complete ✅** - Fee Economics
+- Maker (1.75%) and taker (7.00%) fee calculations
+- Profitability analysis (gross → net P&L)
+- Minimum spread requirements (2¢ to break even)
+- Market evaluation logic (should_quote_market)
+- ROI and per-contract profit metrics
 
 **Coming Next:**
-- Phase 2: Order Book Processing
-- Phase 3: Fee Economics
 - Phase 4: Quote Generation
 - Phase 5: Flow Detection & Toxic Flow Protection
 - Phase 6: Execution Engine
@@ -45,41 +57,69 @@ cp config/config.example.yaml config/config.yaml
 # WARNING: Never commit your API keys!
 ```
 
-### 3. Run Phase 1 Test
+### 3. Run Tests
 
 ```bash
+# Phase 1: API connection and basic functionality
 python phase1_test.py
+
+# Phase 2: Order book processing and analysis
+python phase2_test.py
+
+# Phase 3: Fee calculations and profitability
+python phase3_test.py
+
+# Run all unit tests
+pytest tests/ -v
 ```
 
-Expected output:
+Expected output (Phase 3):
 ```
-✓ Loaded private key
-✓ Client initialized
-✓ Found 10 open markets
-✓ Order book retrieved
-✓ Account balance: $98.00
+✓ Fee calculations working with real data
+✓ Profitability analysis functional
+✓ Market evaluation logic implemented
+✓ Maker fees significantly lower than taker fees
 ```
 
 ## 📁 Project Structure
 
 ```
 kalshiproject/
-├── src/
+├── src/                    # Core modules
 │   ├── __init__.py
-│   └── client.py           # Kalshi API wrapper
+│   ├── client.py           # Kalshi API wrapper (371 lines)
+│   ├── orderbook.py        # Order book processing (290 lines)
+│   └── fees.py             # Fee calculations & profitability (580 lines)
+│
+├── tests/                  # Unit tests (53 tests, all passing)
+│   ├── test_orderbook.py   # Order book tests (18 tests)
+│   └── test_fees.py        # Fee calculation tests (35 tests)
+│
+├── docs/                   # Documentation
+│   ├── PHASE1_SUMMARY.md   # API Foundation
+│   ├── PHASE2_SUMMARY.md   # Order Book Processing
+│   ├── PHASE3_SUMMARY.md   # Fee Economics
+│   ├── KALSHI_MECHANICS.md # How Kalshi markets work
+│   ├── ORDERBOOK_FIX.md    # SDK bug workaround
+│   ├── API_DECISIONS.md    # REST vs WebSocket, sync vs async
+│   └── GIT_SETUP.md        # Repository setup
+│
 ├── config/
 │   ├── README.md
-│   └── config.example.yaml # Configuration template
-├── docs/
-│   ├── PHASE1_SUMMARY.md   # Phase 1 detailed explanation
-│   └── ORDERBOOK_FIX.md    # Technical writeup of SDK bug fix
-├── tests/
-│   └── (test files)
+│   └── config.example.yaml
+│
+├── phase1_test.py          # API & orderbook demo
+├── phase2_test.py          # Order book processing demo
+├── phase3_test.py          # Fee economics demo
+├── test_order_placement.py # Real order placement test
+├── place_demo_orders.py    # Place live orders (no cancel)
+│
 ├── .gitignore              # Protects API keys
 ├── requirements.txt        # Python dependencies
-├── phase1_test.py          # Phase 1 demonstration
 └── README.md               # This file
 ```
+
+**Lines of Code**: ~1,650 (src/) + ~850 (tests/) = 2,500+ lines
 
 ## 🔑 Key Features
 
@@ -90,21 +130,39 @@ kalshiproject/
 - **Order Management**: Place, cancel, and track orders
 - **SDK Bug Workaround**: Bypasses validation errors to get full orderbook depth
 
+### Phase 2: Order Book Processing
+
+- **NO → YES Conversion**: Automatically converts NO bids to YES asks using `100 - X` formula
+- **Market Metrics**: Best bid/ask, mid price, spread, cumulative depth
+- **VWAP Analysis**: Calculate average execution price for large orders
+- **Edge Cases**: Handles empty, one-sided, and crossed markets
+- **Pretty Printing**: Formatted orderbook display for analysis
+
+### Phase 3: Fee Economics
+
+- **Fee Calculations**: Maker (1.75%) vs Taker (7.00%) fees
+- **Profitability**: Full P&L analysis including fees, ROI, per-contract profit
+- **Spread Requirements**: Calculate minimum spread to break even or hit target profit
+- **Market Evaluation**: Automated decision whether to quote a market
+- **Critical Insight**: 2¢ spread profitable as maker, but unprofitable as taker!
+
 ### Understanding Kalshi's Order Book
 
 Kalshi only returns **bids** for YES and NO. A NO bid at price X is equivalent to a YES ask at (100 - X).
 
 **Example:**
 ```python
+from src.orderbook import OrderBook
+
 orderbook = {
   "yes": [[48, 307]],  # Someone will pay 48¢ for YES
   "no": [[51, 873]]    # Someone will pay 51¢ for NO
 }
 
-# Convert to traditional view:
-best_yes_bid = 48¢
-best_yes_ask = 100 - 51 = 49¢  # Implied from NO bid
-spread = 1¢
+ob = OrderBook("TICKER", orderbook)
+print(f"Best Bid: {ob.best_bid}¢")  # 48¢
+print(f"Best Ask: {ob.best_ask}¢")  # 49¢ (from 100 - 51)
+print(f"Spread: {ob.spread}¢")      # 1¢
 ```
 
 ## 🛡️ Security
@@ -135,48 +193,75 @@ credentials.yaml
 
 ## 📚 Documentation
 
-- **[Phase 1 Summary](docs/PHASE1_SUMMARY.md)**: Detailed explanation of authentication, orderbooks, and API usage
-- **[Orderbook Fix](docs/ORDERBOOK_FIX.md)**: Technical details on the SDK bug and our workaround
-- **[Config Guide](config/README.md)**: How to set up your configuration
+### Phase Summaries
+- **[Phase 1: API Foundation](docs/PHASE1_SUMMARY.md)** - Authentication, orderbooks, API usage, SDK bug fix
+- **[Phase 2: Order Book Processing](docs/PHASE2_SUMMARY.md)** - NO→YES conversion, VWAP, depth analysis, 18 tests
+- **[Phase 3: Fee Economics](docs/PHASE3_SUMMARY.md)** - Fee calculations, profitability, minimum spreads, 35 tests
+
+### Technical Guides
+- **[Kalshi Mechanics](docs/KALSHI_MECHANICS.md)** - Why YES + NO > $1, position equivalence, market making strategy
+- **[API Decisions](docs/API_DECISIONS.md)** - REST vs WebSocket, sync vs async, polling frequency
+- **[Orderbook Fix](docs/ORDERBOOK_FIX.md)** - SDK bug workaround details
+- **[Git Setup](docs/GIT_SETUP.md)** - Repository initialization and structure
+
+### Configuration
+- **[Config Guide](config/README.md)** - How to set up your configuration files
 
 ## 🔧 Development
 
-### API Client (src/client.py)
+### Quick Example: End-to-End Market Making Decision
 
 ```python
 from src.client import KalshiClient
+from src.orderbook import OrderBook
+from src.fees import should_quote_market
 
-# Initialize
+# Initialize client
 client = KalshiClient(
     key_id="your-key-id",
     private_key=open('kalshidemo.txt').read(),
     host="https://demo-api.kalshi.co/trade-api/v2"
 )
 
-# Get markets
-markets = client.get_markets(status="open", limit=10)
+# Get market and orderbook
+markets = client.get_markets(status="open", limit=1)
+ticker = markets[0]['ticker']
+raw_ob = client.get_orderbook(ticker, depth=10)
 
-# Get orderbook (full depth)
-orderbook = client.get_orderbook("TICKER", depth=10)
+# Process orderbook
+ob = OrderBook(ticker, raw_ob)
+print(f"Spread: {ob.spread}¢, Mid: {ob.mid_price}¢")
 
-# Place order
-order = client.place_order(
-    ticker="TICKER",
-    side="yes",
-    action="buy",
-    quantity=10,
-    price=45
+# Evaluate profitability
+result = should_quote_market(
+    spread_cents=ob.spread,
+    contracts=100,
+    mid_price_cents=int(ob.mid_price),
+    min_profit_cents=25,
+    as_maker=True
 )
+
+if result['should_quote']:
+    print(f"✅ Quote: {result['recommended_bid']}¢ / {result['recommended_ask']}¢")
+    print(f"   Expected profit: {result['analysis'].net_profit_cents:.2f}¢")
+else:
+    print(f"❌ Skip: {result['reason']}")
 ```
 
 ### Running Tests
 
 ```bash
-# Phase 1 test (current)
-python phase1_test.py
+# All unit tests
+pytest tests/ -v
 
-# Unit tests (coming in later phases)
-pytest tests/
+# Specific module
+pytest tests/test_fees.py -v
+pytest tests/test_orderbook.py -v
+
+# Phase demonstrations
+python phase1_test.py  # API connection
+python phase2_test.py  # Order book processing
+python phase3_test.py  # Fee economics
 ```
 
 ## 🎓 Learning Resources
@@ -211,13 +296,13 @@ The official SDK has a validation bug in the orderbook endpoint. Our client bypa
 
 ## 📈 Roadmap
 
-- [x] Phase 1: API Foundation
-- [ ] Phase 2: Order Book Processing
-- [ ] Phase 3: Fee Economics
-- [ ] Phase 4: Quote Generation
-- [ ] Phase 5: Flow Detection
-- [ ] Phase 6: Execution Engine
-- [ ] Phase 7: Configuration & Deployment
+- [x] **Phase 1: API Foundation** - Authentication, market data, orderbooks, order management
+- [x] **Phase 2: Order Book Processing** - NO→YES conversion, VWAP, depth analysis
+- [x] **Phase 3: Fee Economics** - Fee calculations, profitability, minimum spreads
+- [ ] **Phase 4: Quote Generation** - Optimal pricing, inventory management, quote sizing
+- [ ] **Phase 5: Flow Detection** - Toxic flow detection, adverse selection protection
+- [ ] **Phase 6: Execution Engine** - Order placement, position tracking, risk limits
+- [ ] **Phase 7: Configuration & Deployment** - Config system, logging, monitoring, deployment
 
 ## 🤝 Contributing
 
