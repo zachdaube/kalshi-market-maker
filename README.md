@@ -33,8 +33,16 @@ A sophisticated market making bot for Kalshi prediction markets that provides tw
 - Kalshi order format conversion (YES bid + NO bid)
 - Real market making script that actually places orders
 
+**Phase 5: Complete ✅** - Flow Detection & Toxic Flow Protection
+- Run detection (consecutive trades in same direction)
+- Trade imbalance analysis (buy/sell pressure)
+- Price momentum tracking (rapid price changes)
+- Toxicity scoring (0-100 scale)
+- Adaptive quote adjustments (normal/reduce/widen/pull)
+- Multi-market flow tracking
+- Protection against adverse selection
+
 **Coming Next:**
-- Phase 5: Flow Detection & Toxic Flow Protection
 - Phase 6: Execution Engine
 - Phase 7: Configuration & Deployment
 
@@ -79,10 +87,13 @@ python phase3_test.py
 # Phase 4: Quote generation and position tracking
 python phase4_test.py
 
+# Phase 5: Flow detection and toxic flow protection
+python phase5_test.py
+
 # Real market maker (dry-run mode)
 python simple_market_maker.py
 
-# Run all unit tests (79 tests)
+# Run all unit tests (116 tests)
 pytest tests/ -v
 ```
 
@@ -103,18 +114,21 @@ kalshiproject/
 │   ├── client.py           # Kalshi API wrapper (371 lines)
 │   ├── orderbook.py        # Order book processing (290 lines)
 │   ├── fees.py             # Fee calculations & profitability (580 lines)
-│   └── quotes.py           # Quote generation & position tracking (491 lines)
+│   ├── quotes.py           # Quote generation & position tracking (491 lines)
+│   └── flow.py             # Flow detection & toxic flow protection (680 lines)
 │
-├── tests/                  # Unit tests (79 tests, all passing)
+├── tests/                  # Unit tests (116 tests, all passing)
 │   ├── test_orderbook.py   # Order book tests (18 tests)
 │   ├── test_fees.py        # Fee calculation tests (35 tests)
-│   └── test_quotes.py      # Quote generation tests (26 tests)
+│   ├── test_quotes.py      # Quote generation tests (26 tests)
+│   └── test_flow.py        # Flow detection tests (37 tests)
 │
 ├── docs/                   # Documentation
 │   ├── PHASE1_SUMMARY.md   # API Foundation
 │   ├── PHASE2_SUMMARY.md   # Order Book Processing
 │   ├── PHASE3_SUMMARY.md   # Fee Economics
 │   ├── PHASE4_SUMMARY.md   # Quote Generation
+│   ├── PHASE5_SUMMARY.md   # Flow Detection
 │   ├── KALSHI_MECHANICS.md # How Kalshi markets work
 │   ├── ORDERBOOK_FIX.md    # SDK bug workaround
 │   ├── API_DECISIONS.md    # REST vs WebSocket, sync vs async
@@ -128,6 +142,7 @@ kalshiproject/
 ├── phase2_test.py          # Order book processing demo
 ├── phase3_test.py          # Fee economics demo
 ├── phase4_test.py          # Quote generation demo
+├── phase5_test.py          # Flow detection demo
 ├── simple_market_maker.py  # REAL market maker (places orders!)
 ├── test_order_placement.py # Real order placement test
 ├── place_demo_orders.py    # Place live orders (no cancel)
@@ -137,7 +152,7 @@ kalshiproject/
 └── README.md               # This file
 ```
 
-**Lines of Code**: ~2,140 (src/) + ~1,400 (tests/) = 3,500+ lines
+**Lines of Code**: ~2,820 (src/) + ~2,220 (tests/) = 5,040+ lines
 
 ## 🔑 Key Features
 
@@ -174,6 +189,16 @@ kalshiproject/
 - **Quote Sizing**: Adjust contract quantities based on position limits
 - **Kalshi Conversion**: Convert quotes to Kalshi's order format (YES bid + NO bid)
 - **Real Market Maker**: Simple script that actually places orders on Kalshi
+
+### Phase 5: Flow Detection & Toxic Flow Protection
+
+- **Run Detection**: Identify consecutive trades in the same direction (5+ = toxic)
+- **Trade Imbalance**: Measure buy/sell pressure (70%+ = toxic)
+- **Price Momentum**: Track rapid price changes (5¢+ = suspicious)
+- **Toxicity Scoring**: Quantify flow toxicity on 0-100 scale
+- **Adaptive Adjustments**: Automatically widen spreads, reduce size, or pull quotes
+- **Multi-Market Tracking**: Independent flow analysis per market
+- **Adverse Selection Protection**: Avoid getting picked off by informed traders
 
 ### Understanding Kalshi's Order Book
 
@@ -227,6 +252,7 @@ credentials.yaml
 - **[Phase 2: Order Book Processing](docs/PHASE2_SUMMARY.md)** - NO→YES conversion, VWAP, depth analysis, 18 tests
 - **[Phase 3: Fee Economics](docs/PHASE3_SUMMARY.md)** - Fee calculations, profitability, minimum spreads, 35 tests
 - **[Phase 4: Quote Generation](docs/PHASE4_SUMMARY.md)** - Optimal quoting, inventory skewing, position tracking, 26 tests
+- **[Phase 5: Flow Detection](docs/PHASE5_SUMMARY.md)** - Toxic flow detection, run analysis, quote adjustments, 37 tests
 
 ### Technical Guides
 - **[Kalshi Mechanics](docs/KALSHI_MECHANICS.md)** - Why YES + NO > $1, position equivalence, market making strategy
@@ -303,6 +329,7 @@ python phase1_test.py  # API connection
 python phase2_test.py  # Order book processing
 python phase3_test.py  # Fee economics
 python phase4_test.py  # Quote generation
+python phase5_test.py  # Flow detection & toxic flow protection
 
 # Real market maker
 python simple_market_maker.py         # Dry-run mode (safe)
@@ -345,7 +372,7 @@ The official SDK has a validation bug in the orderbook endpoint. Our client bypa
 - [x] **Phase 2: Order Book Processing** - NO→YES conversion, VWAP, depth analysis
 - [x] **Phase 3: Fee Economics** - Fee calculations, profitability, minimum spreads
 - [x] **Phase 4: Quote Generation** - Optimal pricing, inventory skewing, position tracking, quote sizing
-- [ ] **Phase 5: Flow Detection** - Toxic flow detection, adverse selection protection
+- [x] **Phase 5: Flow Detection** - Run detection, trade imbalance, toxicity scoring, adaptive adjustments
 - [ ] **Phase 6: Execution Engine** - Active order management, real-time position sync, multi-market quoting
 - [ ] **Phase 7: Configuration & Deployment** - Config system, logging, monitoring, deployment
 
