@@ -1,0 +1,37 @@
+# Kalshi Market Maker - Demo Configuration
+# Uses Avellaneda-Stoikov model for optimal quoting
+
+environment: demo
+
+execution:
+  quote_interval: 1.0           # Seconds between quote updates
+  position_sync_interval: 5.0   # Seconds between position syncs
+  total_max_position: 500       # Max total exposure (contracts)
+  cancel_threshold: 1           # Requote if price moves this much
+  dry_run: true                 # No real orders
+
+# Markets to trade with AS model parameters
+markets:
+  - ticker: KXBTC-24DEC29-T59500
+    enabled: true
+    # Avellaneda-Stoikov parameters
+    gamma: 0.1      # Risk aversion (higher = wider spreads)
+    sigma: 2.0      # Volatility estimate (cents)
+    k: 1.5          # Order arrival decay parameter
+    base_size: 10   # Contracts per order
+    max_position: 100
+    max_loss_cents: 500.0
+
+  - ticker: KXETH-24DEC29-T3700
+    enabled: true
+    gamma: 0.1
+    sigma: 2.5      # Slightly higher vol for ETH
+    k: 1.5
+    base_size: 15
+    max_position: 150
+    max_loss_cents: 750.0
+
+api:
+  key_id: ${KALSHI_KEY_ID}
+  private_key_file: kalshidemo.txt
+  host: https://demo-api.kalshi.co/trade-api/v2
