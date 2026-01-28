@@ -1,10 +1,10 @@
 # Kalshi Market Maker
 
-Automated market making bot for Kalshi prediction markets using the Avellaneda-Stoikov optimal quoting model.
+Automated market making bot for Kalshi prediction markets using the Avellaneda-Stoikov optimal quoting model. Includes a real-time web dashboard for monitoring.
 
 ## Requirements
 
-- Python 3.12+
+- Python 3.11+
 - Kalshi API credentials (key ID + private key)
 
 ## Quick Start
@@ -46,15 +46,94 @@ markets:
 
 ### 4. Run
 
+**With Dashboard (Recommended):**
 ```bash
-# Dry run (no orders placed)
+# Dashboard + bot on http://localhost:8080
+python dashboard.py --env demo
+
+# Live trading with dashboard
+python dashboard.py --env demo --live --port 8080
+```
+
+**Headless (no dashboard):**
+```bash
 python run_market_maker.py --env demo
-
-# Live demo (virtual money)
 python run_market_maker.py --env demo --live
+```
 
-# Production (REAL MONEY)
-python run_market_maker.py --env prod --live
+## Dashboard
+
+The web dashboard provides real-time visualization of:
+- **Statistics**: Quotes placed, fills, cancels, P&L
+- **Order Book**: Live bid/ask levels with depth
+- **Positions**: Current inventory for each market
+- **Active Quotes**: Your bid/ask prices and sizes
+- **Event Log**: Trade and quote history
+
+Access at `http://localhost:8080` after starting.
+
+## Background Deployment
+
+### Option 1: Docker (Recommended)
+
+```bash
+# Build and run
+docker-compose up -d
+
+# View logs
+docker-compose logs -f
+
+# Stop
+docker-compose down
+```
+
+The dashboard will be available at `http://localhost:8080`.
+
+To run with live trading, edit `docker-compose.yml`:
+```yaml
+command: python dashboard.py --env prod --live --port 8080
+```
+
+### Option 2: systemd (Linux)
+
+Create `/etc/systemd/system/kalshi-mm.service`:
+
+```ini
+[Unit]
+Description=Kalshi Market Maker
+After=network.target
+
+[Service]
+Type=simple
+User=your-user
+WorkingDirectory=/path/to/kalshi-market-maker
+Environment=KALSHI_KEY_ID=your-key-id
+ExecStart=/usr/bin/python3 dashboard.py --env demo --port 8080
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable kalshi-mm
+sudo systemctl start kalshi-mm
+sudo systemctl status kalshi-mm
+```
+
+### Option 3: Screen/tmux
+
+```bash
+# Start in background
+screen -dmS kalshi python dashboard.py --env demo
+
+# Attach to view
+screen -r kalshi
+
+# Detach: Ctrl+A, D
 ```
 
 ## How It Works
@@ -86,7 +165,10 @@ See `docs/AVELLANEDA_STOIKOV_GUIDE.md` for detailed parameter tuning.
 
 ```
 kalshi-market-maker/
-├── run_market_maker.py    # Entry point
+├── dashboard.py           # Web dashboard + bot (main entry)
+├── run_market_maker.py    # Headless bot
+├── Dockerfile
+├── docker-compose.yml
 ├── src/
 │   ├── client.py          # Kalshi API wrapper
 │   ├── execution.py       # Main trading loop
@@ -100,8 +182,8 @@ kalshi-market-maker/
 │   └── prod.yaml          # Production config
 ├── tests/                 # Unit tests
 └── docs/
-    ├── AVELLANEDA_STOIKOV_GUIDE.md  # Model details
-    └── KALSHI_MECHANICS.md          # Kalshi market mechanics
+    ├── AVELLANEDA_STOIKOV_GUIDE.md
+    └── KALSHI_MECHANICS.md
 ```
 
 ## Testing
