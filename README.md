@@ -1,396 +1,213 @@
-# Kalshi Market Making Bot
+# Kalshi Market Maker
 
-A sophisticated market making bot for Kalshi prediction markets that provides two-sided liquidity, captures bid-ask spreads, and manages inventory risk.
+Automated market making bot for Kalshi prediction markets using the Avellaneda-Stoikov optimal quoting model. Includes a real-time web dashboard for monitoring.
 
-## 🎯 Project Status
+## Requirements
 
-**Phase 1: Complete ✅** - API Foundation
-- Authenticated API connection via RSA keys
-- Market data retrieval and filtering
-- Full orderbook depth (with SDK bug workaround)
-- Order management (place, cancel, track)
-- Portfolio tracking and balance queries
+- Python 3.11+
+- Kalshi API credentials (key ID + private key)
 
-**Phase 2: Complete ✅** - Order Book Processing
-- NO bid → YES ask conversion (100 - X formula)
-- Best bid/ask, mid price, spread calculations
-- VWAP (Volume-Weighted Average Price) analysis
-- Depth analysis and cumulative liquidity tracking
-- Edge case handling (empty, crossed, one-sided markets)
+## Quick Start
 
-**Phase 3: Complete ✅** - Fee Economics
-- Maker (1.75%) and taker (7.00%) fee calculations
-- Profitability analysis (gross → net P&L)
-- Minimum spread requirements (2¢ to break even)
-- Market evaluation logic (should_quote_market)
-- ROI and per-contract profit metrics
-
-**Phase 4: Complete ✅** - Quote Generation
-- Optimal bid/ask quote generation centered on fair value
-- Inventory skewing (adjust quotes based on position)
-- Position tracking with average entry price and P&L
-- Quote sizing based on risk limits
-- Kalshi order format conversion (YES bid + NO bid)
-- Real market making script that actually places orders
-
-**Phase 5: Complete ✅** - Flow Detection & Toxic Flow Protection
-- Run detection (consecutive trades in same direction)
-- Trade imbalance analysis (buy/sell pressure)
-- Price momentum tracking (rapid price changes)
-- Toxicity scoring (0-100 scale)
-- Adaptive quote adjustments (normal/reduce/widen/pull)
-- Multi-market flow tracking
-- Protection against adverse selection
-
-**Coming Next:**
-- Phase 6: Execution Engine
-- Phase 7: Configuration & Deployment
-
-## 🚀 Quick Start
-
-### 1. Installation
+### 1. Install
 
 ```bash
-# Clone the repository
-git clone <your-repo-url>
-cd kalshiproject
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 2. Configuration
+### 2. Get API Credentials
+
+1. Go to https://kalshi.com/account/api (or https://demo.kalshi.co for demo)
+2. Generate an API key pair
+3. Download the private key file
+4. Set environment variable:
+   ```bash
+   export KALSHI_KEY_ID="your-key-id"
+   ```
+5. Save the private key as:
+   - `kalshidemo.txt` for demo environment
+   - `kalshiprod.txt` for production
+
+### 3. Configure
+
+Edit `config/demo.yaml` or `config/prod.yaml`:
+
+```yaml
+markets:
+  - ticker: YOUR_MARKET_TICKER  # Find at kalshi.com/markets
+    enabled: true
+    gamma: 0.1      # Risk aversion
+    sigma: 2.0      # Volatility estimate
+    k: 1.5          # Order arrival decay
+    base_size: 10   # Contracts per order
+    max_position: 100
+    max_loss_cents: 500.0
+```
+
+### 4. Run
+
+**With Dashboard (Recommended):**
+```bash
+# Dashboard + bot on http://localhost:8080
+python dashboard.py --env demo
+
+# Live trading with dashboard
+python dashboard.py --env demo --live --port 8080
+```
+
+**Headless (no dashboard):**
+```bash
+python run_market_maker.py --env demo
+python run_market_maker.py --env demo --live
+```
+
+## Dashboard
+
+The web dashboard provides real-time visualization of:
+- **Statistics**: Quotes placed, fills, cancels, P&L
+- **Order Book**: Live bid/ask levels with depth
+- **Positions**: Current inventory for each market
+- **Active Quotes**: Your bid/ask prices and sizes
+- **Event Log**: Trade and quote history
+
+Access at `http://localhost:8080` after starting.
+
+## Background Deployment
+
+### Option 1: Docker (Recommended)
 
 ```bash
-# Set up your API credentials
-# 1. Get your API key ID and private key from Kalshi
-# 2. Save private key to kalshidemo.txt (for demo) or zachdaube.txt (for production)
-# 3. Copy config example
-cp config/config.example.yaml config/config.yaml
+# Build and run
+docker-compose up -d
 
-# 4. Edit config.yaml with your API key ID
-# WARNING: Never commit your API keys!
+# View logs
+docker-compose logs -f
+
+# Stop
+docker-compose down
 ```
 
-### 3. Run Tests
+The dashboard will be available at `http://localhost:8080`.
+
+To run with live trading, edit `docker-compose.yml`:
+```yaml
+command: python dashboard.py --env prod --live --port 8080
+```
+
+### Option 2: systemd (Linux)
+
+Create `/etc/systemd/system/kalshi-mm.service`:
+
+```ini
+[Unit]
+Description=Kalshi Market Maker
+After=network.target
+
+[Service]
+Type=simple
+User=your-user
+WorkingDirectory=/path/to/kalshi-market-maker
+Environment=KALSHI_KEY_ID=your-key-id
+ExecStart=/usr/bin/python3 dashboard.py --env demo --port 8080
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable kalshi-mm
+sudo systemctl start kalshi-mm
+sudo systemctl status kalshi-mm
+```
+
+### Option 3: Screen/tmux
 
 ```bash
-# Phase 1: API connection and basic functionality
-python phase1_test.py
+# Start in background
+screen -dmS kalshi python dashboard.py --env demo
 
-# Phase 2: Order book processing and analysis
-python phase2_test.py
+# Attach to view
+screen -r kalshi
 
-# Phase 3: Fee calculations and profitability
-python phase3_test.py
-
-# Phase 4: Quote generation and position tracking
-python phase4_test.py
-
-# Phase 5: Flow detection and toxic flow protection
-python phase5_test.py
-
-# Real market maker (dry-run mode)
-python simple_market_maker.py
-
-# Run all unit tests (116 tests)
-pytest tests/ -v
+# Detach: Ctrl+A, D
 ```
 
-Expected output (Phase 3):
-```
-✓ Fee calculations working with real data
-✓ Profitability analysis functional
-✓ Market evaluation logic implemented
-✓ Maker fees significantly lower than taker fees
-```
+## How It Works
 
-## 📁 Project Structure
+The bot uses the Avellaneda-Stoikov model to calculate optimal quotes:
+
+1. **Reservation Price**: `r = mid - inventory * gamma * sigma^2`
+   - Adjusts fair value based on inventory to encourage mean reversion
+
+2. **Optimal Spread**: `spread = (2/gamma) * ln(1 + gamma/k)`
+   - Calibrated to order arrival rates and risk preferences
+
+3. **Quote Placement**: Posts bid at `r - spread/2`, ask at `r + spread/2`
+
+See `docs/AVELLANEDA_STOIKOV_GUIDE.md` for detailed parameter tuning.
+
+## Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `gamma` | 0.1 | Risk aversion. Higher = wider spreads when positioned |
+| `sigma` | 2.0 | Volatility estimate in cents |
+| `k` | 1.5 | Order arrival decay. Lower = expect fills at wider spreads |
+| `base_size` | 10 | Contracts per order |
+| `max_position` | 100 | Max inventory before pulling quotes |
+| `max_loss_cents` | 500 | Stop loss threshold |
+
+## Project Structure
 
 ```
-kalshiproject/
-├── src/                    # Core modules
-│   ├── __init__.py
-│   ├── client.py           # Kalshi API wrapper (371 lines)
-│   ├── orderbook.py        # Order book processing (290 lines)
-│   ├── fees.py             # Fee calculations & profitability (580 lines)
-│   ├── quotes.py           # Quote generation & position tracking (491 lines)
-│   └── flow.py             # Flow detection & toxic flow protection (680 lines)
-│
-├── tests/                  # Unit tests (116 tests, all passing)
-│   ├── test_orderbook.py   # Order book tests (18 tests)
-│   ├── test_fees.py        # Fee calculation tests (35 tests)
-│   ├── test_quotes.py      # Quote generation tests (26 tests)
-│   └── test_flow.py        # Flow detection tests (37 tests)
-│
-├── docs/                   # Documentation
-│   ├── PHASE1_SUMMARY.md   # API Foundation
-│   ├── PHASE2_SUMMARY.md   # Order Book Processing
-│   ├── PHASE3_SUMMARY.md   # Fee Economics
-│   ├── PHASE4_SUMMARY.md   # Quote Generation
-│   ├── PHASE5_SUMMARY.md   # Flow Detection
-│   ├── KALSHI_MECHANICS.md # How Kalshi markets work
-│   ├── ORDERBOOK_FIX.md    # SDK bug workaround
-│   ├── API_DECISIONS.md    # REST vs WebSocket, sync vs async
-│   └── GIT_SETUP.md        # Repository setup
-│
+kalshi-market-maker/
+├── dashboard.py           # Web dashboard + bot (main entry)
+├── run_market_maker.py    # Headless bot
+├── Dockerfile
+├── docker-compose.yml
+├── src/
+│   ├── client.py          # Kalshi API wrapper
+│   ├── execution.py       # Main trading loop
+│   ├── quotes.py          # Avellaneda-Stoikov model
+│   ├── orderbook.py       # Order book processing
+│   ├── fees.py            # Fee calculations
+│   ├── flow.py            # Toxic flow detection
+│   └── config_loader.py   # Configuration loading
 ├── config/
-│   ├── README.md
-│   └── config.example.yaml
-│
-├── phase1_test.py          # API & orderbook demo
-├── phase2_test.py          # Order book processing demo
-├── phase3_test.py          # Fee economics demo
-├── phase4_test.py          # Quote generation demo
-├── phase5_test.py          # Flow detection demo
-├── simple_market_maker.py  # REAL market maker (places orders!)
-├── test_order_placement.py # Real order placement test
-├── place_demo_orders.py    # Place live orders (no cancel)
-│
-├── .gitignore              # Protects API keys
-├── requirements.txt        # Python dependencies
-└── README.md               # This file
+│   ├── demo.yaml          # Demo environment config
+│   └── prod.yaml          # Production config
+├── tests/                 # Unit tests
+└── docs/
+    ├── AVELLANEDA_STOIKOV_GUIDE.md
+    └── KALSHI_MECHANICS.md
 ```
 
-**Lines of Code**: ~2,820 (src/) + ~2,220 (tests/) = 5,040+ lines
-
-## 🔑 Key Features
-
-### Phase 1: API Foundation
-
-- **RSA Key Authentication**: Secure cryptographic authentication with Kalshi
-- **Market Data**: Fetch markets, orderbooks, trades, and portfolio data
-- **Order Management**: Place, cancel, and track orders
-- **SDK Bug Workaround**: Bypasses validation errors to get full orderbook depth
-
-### Phase 2: Order Book Processing
-
-- **NO → YES Conversion**: Automatically converts NO bids to YES asks using `100 - X` formula
-- **Market Metrics**: Best bid/ask, mid price, spread, cumulative depth
-- **VWAP Analysis**: Calculate average execution price for large orders
-- **Edge Cases**: Handles empty, one-sided, and crossed markets
-- **Pretty Printing**: Formatted orderbook display for analysis
-
-### Phase 3: Fee Economics
-
-- **Fee Calculations**: Maker (1.75%) vs Taker (7.00%) fees
-- **Profitability**: Full P&L analysis including fees, ROI, per-contract profit
-- **Spread Requirements**: Calculate minimum spread to break even or hit target profit
-- **Market Evaluation**: Automated decision whether to quote a market
-- **Critical Insight**: 2¢ spread profitable as maker, but unprofitable as taker!
-
-### Phase 4: Quote Generation
-
-- **Optimal Quoting**: Generate bid/ask quotes centered on fair value (mid price)
-- **Inventory Skewing**: Adjust quotes based on position to manage risk
-  - Long position → skew DOWN to encourage selling
-  - Short position → skew UP to encourage buying
-- **Position Tracking**: Maintain average entry price and unrealized P&L
-- **Quote Sizing**: Adjust contract quantities based on position limits
-- **Kalshi Conversion**: Convert quotes to Kalshi's order format (YES bid + NO bid)
-- **Real Market Maker**: Simple script that actually places orders on Kalshi
-
-### Phase 5: Flow Detection & Toxic Flow Protection
-
-- **Run Detection**: Identify consecutive trades in the same direction (5+ = toxic)
-- **Trade Imbalance**: Measure buy/sell pressure (70%+ = toxic)
-- **Price Momentum**: Track rapid price changes (5¢+ = suspicious)
-- **Toxicity Scoring**: Quantify flow toxicity on 0-100 scale
-- **Adaptive Adjustments**: Automatically widen spreads, reduce size, or pull quotes
-- **Multi-Market Tracking**: Independent flow analysis per market
-- **Adverse Selection Protection**: Avoid getting picked off by informed traders
-
-### Understanding Kalshi's Order Book
-
-Kalshi only returns **bids** for YES and NO. A NO bid at price X is equivalent to a YES ask at (100 - X).
-
-**Example:**
-```python
-from src.orderbook import OrderBook
-
-orderbook = {
-  "yes": [[48, 307]],  # Someone will pay 48¢ for YES
-  "no": [[51, 873]]    # Someone will pay 51¢ for NO
-}
-
-ob = OrderBook("TICKER", orderbook)
-print(f"Best Bid: {ob.best_bid}¢")  # 48¢
-print(f"Best Ask: {ob.best_ask}¢")  # 49¢ (from 100 - 51)
-print(f"Spread: {ob.spread}¢")      # 1¢
-```
-
-## 🛡️ Security
-
-### API Key Protection
-
-Your API keys are **never committed** to the repository:
-
-```gitignore
-# .gitignore includes:
-*.pem
-*demo.txt
-zachdaube.txt
-kalshidemo.txt
-*.key
-credentials.yaml
-.env
-```
-
-### Demo vs Production
-
-| Environment | Host | Purpose |
-|------------|------|---------|
-| **Demo** | `demo-api.kalshi.co` | Safe testing, virtual money |
-| **Production** | `api.elections.kalshi.com` | Real trading, real money |
-
-**Always test on demo first!**
-
-## 📚 Documentation
-
-### Phase Summaries
-- **[Phase 1: API Foundation](docs/PHASE1_SUMMARY.md)** - Authentication, orderbooks, API usage, SDK bug fix
-- **[Phase 2: Order Book Processing](docs/PHASE2_SUMMARY.md)** - NO→YES conversion, VWAP, depth analysis, 18 tests
-- **[Phase 3: Fee Economics](docs/PHASE3_SUMMARY.md)** - Fee calculations, profitability, minimum spreads, 35 tests
-- **[Phase 4: Quote Generation](docs/PHASE4_SUMMARY.md)** - Optimal quoting, inventory skewing, position tracking, 26 tests
-- **[Phase 5: Flow Detection](docs/PHASE5_SUMMARY.md)** - Toxic flow detection, run analysis, quote adjustments, 37 tests
-
-### Technical Guides
-- **[Kalshi Mechanics](docs/KALSHI_MECHANICS.md)** - Why YES + NO > $1, position equivalence, market making strategy
-- **[API Decisions](docs/API_DECISIONS.md)** - REST vs WebSocket, sync vs async, polling frequency
-- **[Orderbook Fix](docs/ORDERBOOK_FIX.md)** - SDK bug workaround details
-- **[Git Setup](docs/GIT_SETUP.md)** - Repository initialization and structure
-
-### Configuration
-- **[Config Guide](config/README.md)** - How to set up your configuration files
-
-## 🔧 Development
-
-### Quick Example: End-to-End Market Making Decision
-
-```python
-from src.client import KalshiClient
-from src.orderbook import OrderBook
-from src.quotes import QuoteGenerator, QuoteParams, Position
-
-# Initialize client
-client = KalshiClient(
-    key_id="your-key-id",
-    private_key=open('kalshidemo.txt').read(),
-    host="https://demo-api.kalshi.co/trade-api/v2"
-)
-
-# Get market and orderbook
-markets = client.get_markets(status="open", limit=1)
-ticker = markets[0]['ticker']
-raw_ob = client.get_orderbook(ticker, depth=10)
-
-# Process orderbook
-ob = OrderBook(ticker, raw_ob)
-print(f"Spread: {ob.spread}¢, Mid: {ob.mid_price}¢")
-
-# Configure quote generator
-params = QuoteParams(
-    min_spread_cents=2,
-    target_spread_cents=3,
-    base_size=10,
-    max_position=100,
-    skew_enabled=True,
-    min_profit_cents=5
-)
-
-# Generate quote (with flat position)
-generator = QuoteGenerator(params)
-quote = generator.generate_quote(ob, position=None)
-
-if quote:
-    print(f"✅ Quote: {quote.bid.price_cents}¢ / {quote.ask.price_cents}¢")
-    print(f"   Size: {quote.bid.quantity} contracts")
-    print(f"   Expected profit: {quote.expected_profit_cents:.2f}¢")
-
-    # Convert to Kalshi orders
-    yes_bid, no_bid = quote.to_kalshi_orders()
-    # Place orders using client.place_order(...)
-else:
-    print(f"❌ Market not quotable")
-```
-
-### Running Tests
+## Testing
 
 ```bash
-# All unit tests
 pytest tests/ -v
-
-# Specific module
-pytest tests/test_fees.py -v
-pytest tests/test_orderbook.py -v
-
-# Phase demonstrations
-python phase1_test.py  # API connection
-python phase2_test.py  # Order book processing
-python phase3_test.py  # Fee economics
-python phase4_test.py  # Quote generation
-python phase5_test.py  # Flow detection & toxic flow protection
-
-# Real market maker
-python simple_market_maker.py         # Dry-run mode (safe)
-python simple_market_maker.py --live  # Live mode (places real orders!)
 ```
 
-## 🎓 Learning Resources
+## Security
 
-### How Market Making Works
+API credentials are protected via `.gitignore`. Never commit:
+- Private key files (`*.txt`, `*.pem`, `*.key`)
+- Environment files (`.env`)
+- Credential configs
 
-1. **Post two-sided quotes**: Bid below fair value, ask above
-2. **Capture the spread**: Profit from the difference
-3. **Manage inventory**: Don't accumulate too much directional risk
-4. **Avoid toxic flow**: Don't get picked off by informed traders
+## Risk Warning
 
-### Kalshi-Specific Concepts
+Market making involves financial risk. Start with:
+- Demo environment first
+- Small position sizes
+- Tight stop losses
 
-- **Binary markets**: YES/NO outcomes, prices from 0¢ to 100¢
-- **NO bid = YES ask**: Understanding the complementary nature
-- **Fee structure**: Maker fees (0.0175 × C × P × (1-P)), taker fees 4x higher
-- **Settlement**: Markets resolve to 0¢ or 100¢ based on outcome
+Monitor continuously and be ready to stop the bot.
 
-## ⚠️ Risk Warnings
+## License
 
-- **Start small**: Test with minimal position sizes
-- **Use demo first**: Never go straight to production
-- **Set limits**: Max position, max loss per session
-- **Monitor closely**: Market making can lose money if not managed
-- **Understand fees**: They eat into your profits
-
-## 🐛 Known Issues
-
-### kalshi_python_sync SDK Bug
-
-The official SDK has a validation bug in the orderbook endpoint. Our client bypasses this with raw HTTP requests. See [ORDERBOOK_FIX.md](docs/ORDERBOOK_FIX.md) for details.
-
-## 📈 Roadmap
-
-- [x] **Phase 1: API Foundation** - Authentication, market data, orderbooks, order management
-- [x] **Phase 2: Order Book Processing** - NO→YES conversion, VWAP, depth analysis
-- [x] **Phase 3: Fee Economics** - Fee calculations, profitability, minimum spreads
-- [x] **Phase 4: Quote Generation** - Optimal pricing, inventory skewing, position tracking, quote sizing
-- [x] **Phase 5: Flow Detection** - Run detection, trade imbalance, toxicity scoring, adaptive adjustments
-- [ ] **Phase 6: Execution Engine** - Active order management, real-time position sync, multi-market quoting
-- [ ] **Phase 7: Configuration & Deployment** - Config system, logging, monitoring, deployment
-
-## 🤝 Contributing
-
-This is a personal project for learning market making. Feel free to fork and experiment!
-
-## 📄 License
-
-MIT License - Use at your own risk
-
-## ⚖️ Disclaimer
-
-This software is for educational purposes. Market making involves financial risk. The authors assume no liability for financial losses. Always trade responsibly and never risk more than you can afford to lose.
-
----
-
-**Built with:**
-- Python 3.12+
-- kalshi_python_sync SDK
-- Love for prediction markets 📊
+MIT License - Use at your own risk.

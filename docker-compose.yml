@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  market-maker:
+    build: .
+    container_name: kalshi-market-maker
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - KALSHI_KEY_ID=${KALSHI_KEY_ID}
+    volumes:
+      # Mount your private key file
+      - ./kalshidemo.txt:/app/kalshidemo.txt:ro
+      - ./kalshiprod.txt:/app/kalshiprod.txt:ro
+      # Mount config for easy editing
+      - ./config:/app/config:ro
+    command: python dashboard.py --env demo --port 8080
+    # For production with live trading:
+    # command: python dashboard.py --env prod --live --port 8080

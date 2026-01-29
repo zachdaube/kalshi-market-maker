@@ -1,0 +1,29 @@
+# Kalshi Market Maker - Production Configuration
+# WARNING: This uses REAL money!
+
+environment: prod
+
+execution:
+  quote_interval: 1.0           # Seconds between quote updates
+  position_sync_interval: 5.0   # Seconds between position syncs
+  total_max_position: 100       # Max total exposure (conservative)
+  cancel_threshold: 1           # Requote if price moves this much
+  dry_run: false                # REAL ORDERS
+
+# Markets to trade with AS model parameters
+# Find active markets at: https://kalshi.com/markets
+markets:
+  - ticker: REPLACE_WITH_MARKET_TICKER
+    enabled: true
+    # Avellaneda-Stoikov parameters
+    gamma: 0.1      # Risk aversion (higher = wider spreads)
+    sigma: 2.0      # Volatility estimate (cents)
+    k: 1.5          # Order arrival decay parameter
+    base_size: 5    # Start small - contracts per order
+    max_position: 25
+    max_loss_cents: 100.0
+
+api:
+  key_id: ${KALSHI_KEY_ID}
+  private_key_file: kalshiprod.txt
+  host: https://trading-api.kalshi.com/trade-api/v2
