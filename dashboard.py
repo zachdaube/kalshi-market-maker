@@ -769,7 +769,10 @@ def run_dashboard(env: str, live: bool, port: int):
     print(f"  Markets: {list(markets.keys())}")
 
     try:
-        client = KalshiClient(key_id=key_id, private_key_path=key_file, host=host)
+        # Read private key from file
+        with open(key_file, 'r') as f:
+            private_key = f.read()
+        client = KalshiClient(key_id=key_id, private_key=private_key, host=host)
         print("  Client initialized successfully")
     except Exception as e:
         print(f"  Warning: Could not initialize client: {e}")

@@ -13,7 +13,7 @@ execution:
 # Markets to trade with AS model parameters
 # Find active markets at: https://kalshi.com/markets
 markets:
-  - ticker: REPLACE_WITH_MARKET_TICKER
+  - ticker: KXMETEOR-30
     enabled: true
     # Avellaneda-Stoikov parameters
     gamma: 0.1      # Risk aversion (higher = wider spreads)
@@ -26,4 +26,4 @@ markets:
 api:
   key_id: ${KALSHI_KEY_ID}
   private_key_file: kalshiprod.txt
-  host: https://trading-api.kalshi.com/trade-api/v2
+  host: https://api.elections.kalshi.com/trade-api/v2

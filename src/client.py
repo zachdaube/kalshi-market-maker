@@ -3,8 +3,9 @@ Kalshi API client wrapper for market data and order management.
 """
 
 from typing import Optional, Dict, List, Any
-from kalshi_python_sync import Configuration, KalshiClient as KalshiAPIClient
+from kalshi_python_sync import Configuration, KalshiClient as KalshiAPIClient, PortfolioApi, MarketApi, OrdersApi
 import json
+import uuid
 
 class KalshiClient:
     """
@@ -32,6 +33,9 @@ class KalshiClient:
         config.private_key_pem = private_key
 
         self.client = KalshiAPIClient(config)
+        self.portfolio_api = PortfolioApi(self.client)
+        self.market_api = MarketApi(self.client)
+        self.orders_api = OrdersApi(self.client)
 
     # ==================== Market Data Methods ====================
 
@@ -61,7 +65,7 @@ class KalshiClient:
             if event_ticker:
                 params["event_ticker"] = event_ticker
 
-            response = self.client.get_markets(**params)
+            response = self.market_api.get_markets(**params)
 
             # Convert Pydantic models to dictionaries
             if hasattr(response, 'markets'):
@@ -90,7 +94,7 @@ class KalshiClient:
             Market details dictionary or None if not found
         """
         try:
-            response = self.client.get_market(ticker=ticker)
+            response = self.market_api.get_market(ticker=ticker)
             if hasattr(response, 'market'):
                 market = response.market
                 if hasattr(market, 'model_dump'):
@@ -190,7 +194,7 @@ class KalshiClient:
             List of trade dictionaries
         """
         try:
-            response = self.client.get_trades(ticker=ticker, limit=limit)
+            response = self.market_api.get_trades(ticker=ticker, limit=limit)
             if hasattr(response, 'trades'):
                 trades = []
                 for trade in response.trades:
@@ -234,7 +238,7 @@ class KalshiClient:
         try:
             params = {
                 "ticker": ticker,
-                "client_order_id": client_order_id or f"{ticker}_{side}_{action}_{price}",
+                "client_order_id": client_order_id or f"{ticker}_{side}_{action}_{price}_{uuid.uuid4().hex[:8]}",
                 "side": side,
                 "action": action,
                 "count": quantity,
@@ -245,7 +249,7 @@ class KalshiClient:
                 params["yes_price"] = price if side == "yes" else None
                 params["no_price"] = price if side == "no" else None
 
-            response = self.client.create_order(**params)
+            response = self.orders_api.create_order(**params)
             if hasattr(response, 'order'):
                 order = response.order
                 if hasattr(order, 'model_dump'):
@@ -269,7 +273,7 @@ class KalshiClient:
             True if successful, False otherwise
         """
         try:
-            self.client.cancel_order(order_id=order_id)
+            self.orders_api.cancel_order(order_id=order_id)
             return True
         except Exception as e:
             print(f"Error canceling order {order_id}: {e}")
@@ -311,7 +315,7 @@ class KalshiClient:
             if ticker:
                 params["ticker"] = ticker
 
-            response = self.client.get_orders(**params)
+            response = self.orders_api.get_orders(**params)
             if hasattr(response, 'orders'):
                 orders = []
                 for order in response.orders:
@@ -335,9 +339,9 @@ class KalshiClient:
             List of position dictionaries
         """
         try:
-            response = self.client.get_portfolio()
+            response = self.portfolio_api.get_positions()
 
-            # The portfolio response contains market positions
+            # The response contains market positions
             if hasattr(response, 'market_positions'):
                 positions = []
                 for pos in response.market_positions:
@@ -361,7 +365,7 @@ class KalshiClient:
             Balance dictionary with available balance, etc.
         """
         try:
-            response = self.client.get_balance()
+            response = self.portfolio_api.get_balance()
             return {
                 "balance": response.balance if hasattr(response, 'balance') else 0,
                 "portfolio_value": response.portfolio_value if hasattr(response, 'portfolio_value') else 0,
