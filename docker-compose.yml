@@ -15,6 +15,7 @@ services:
       - ./kalshiprod.txt:/app/kalshiprod.txt:ro
       # Mount config for easy editing
       - ./config:/app/config:ro
-    command: python dashboard.py --env demo --port 8080
+    # For demo mode (paper trading):
+    # command: python dashboard.py --env demo --port 8080
     # For production with live trading:
-    # command: python dashboard.py --env prod --live --port 8080
+    command: python dashboard.py --env prod --live --yes --port 8080

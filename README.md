@@ -6,6 +6,7 @@ Automated market making bot for Kalshi prediction markets using the Avellaneda-S
 
 - Python 3.11+
 - Kalshi API credentials (key ID + private key)
+- Docker (for cloud deployment)
 
 ## Quick Start
 
@@ -20,11 +21,7 @@ pip install -r requirements.txt
 1. Go to https://kalshi.com/account/api (or https://demo.kalshi.co for demo)
 2. Generate an API key pair
 3. Download the private key file
-4. Set environment variable:
-   ```bash
-   export KALSHI_KEY_ID="your-key-id"
-   ```
-5. Save the private key as:
+4. Save the private key as:
    - `kalshidemo.txt` for demo environment
    - `kalshiprod.txt` for production
 
@@ -44,7 +41,7 @@ markets:
     max_loss_cents: 500.0
 ```
 
-### 4. Run
+### 4. Run Locally
 
 **With Dashboard (Recommended):**
 ```bash
@@ -61,6 +58,43 @@ python run_market_maker.py --env demo
 python run_market_maker.py --env demo --live
 ```
 
+## Cloud Deployment (DigitalOcean)
+
+Deploy to a cloud server so the bot runs 24/7 without your computer being on.
+
+### Initial Setup
+
+1. Create a DigitalOcean droplet (Ubuntu 24.04, $6/month is sufficient)
+2. Update the IP address in `scripts/deploy.sh` and `scripts/bot.sh`
+
+### Deploy
+
+```bash
+./scripts/deploy.sh
+```
+
+This will:
+1. Run all tests locally to verify the code works
+2. Set up Docker on the server (first time only)
+3. Copy project files to the server
+4. Build and start the bot
+
+### Control the Bot
+
+| Command | Description |
+|---------|-------------|
+| `./scripts/bot.sh stop` | **EMERGENCY STOP** - Immediately stop the bot |
+| `./scripts/bot.sh start` | Start the bot |
+| `./scripts/bot.sh restart` | Restart the bot |
+| `./scripts/bot.sh status` | Check if bot is running |
+| `./scripts/bot.sh logs` | Stream live logs (Ctrl+C to exit) |
+| `./scripts/bot.sh logs-tail` | Show last 50 log lines |
+| `./scripts/bot.sh ssh` | SSH into the server |
+
+### Access Dashboard
+
+Once deployed, access the dashboard at: `http://YOUR_DROPLET_IP:8080`
+
 ## Dashboard
 
 The web dashboard provides real-time visualization of:
@@ -69,72 +103,6 @@ The web dashboard provides real-time visualization of:
 - **Positions**: Current inventory for each market
 - **Active Quotes**: Your bid/ask prices and sizes
 - **Event Log**: Trade and quote history
-
-Access at `http://localhost:8080` after starting.
-
-## Background Deployment
-
-### Option 1: Docker (Recommended)
-
-```bash
-# Build and run
-docker-compose up -d
-
-# View logs
-docker-compose logs -f
-
-# Stop
-docker-compose down
-```
-
-The dashboard will be available at `http://localhost:8080`.
-
-To run with live trading, edit `docker-compose.yml`:
-```yaml
-command: python dashboard.py --env prod --live --port 8080
-```
-
-### Option 2: systemd (Linux)
-
-Create `/etc/systemd/system/kalshi-mm.service`:
-
-```ini
-[Unit]
-Description=Kalshi Market Maker
-After=network.target
-
-[Service]
-Type=simple
-User=your-user
-WorkingDirectory=/path/to/kalshi-market-maker
-Environment=KALSHI_KEY_ID=your-key-id
-ExecStart=/usr/bin/python3 dashboard.py --env demo --port 8080
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Then:
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable kalshi-mm
-sudo systemctl start kalshi-mm
-sudo systemctl status kalshi-mm
-```
-
-### Option 3: Screen/tmux
-
-```bash
-# Start in background
-screen -dmS kalshi python dashboard.py --env demo
-
-# Attach to view
-screen -r kalshi
-
-# Detach: Ctrl+A, D
-```
 
 ## How It Works
 
@@ -169,6 +137,9 @@ kalshi-market-maker/
 ├── run_market_maker.py    # Headless bot
 ├── Dockerfile
 ├── docker-compose.yml
+├── scripts/
+│   ├── deploy.sh          # Deploy to cloud server
+│   └── bot.sh             # Control bot (start/stop/logs)
 ├── src/
 │   ├── client.py          # Kalshi API wrapper
 │   ├── execution.py       # Main trading loop
@@ -188,6 +159,8 @@ kalshi-market-maker/
 
 ## Testing
 
+Run tests before deploying (deploy script does this automatically):
+
 ```bash
 pytest tests/ -v
 ```
@@ -198,6 +171,11 @@ API credentials are protected via `.gitignore`. Never commit:
 - Private key files (`*.txt`, `*.pem`, `*.key`)
 - Environment files (`.env`)
 - Credential configs
+
+**After deployment**, consider:
+- Changing your droplet password
+- Setting up SSH key authentication
+- Restricting dashboard access with a firewall
 
 ## Risk Warning
 

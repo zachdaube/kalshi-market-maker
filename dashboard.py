@@ -800,10 +800,12 @@ def main():
                         help='Enable live trading (disables dry run)')
     parser.add_argument('--port', type=int, default=8080,
                         help='Dashboard port (default: 8080)')
+    parser.add_argument('--yes', '-y', action='store_true',
+                        help='Skip confirmation prompt (for automated deployments)')
 
     args = parser.parse_args()
 
-    if args.live and args.env == 'prod':
+    if args.live and args.env == 'prod' and not args.yes:
         print("\n" + "=" * 50)
         print("WARNING: PRODUCTION LIVE MODE")
         print("This will place REAL orders with REAL money!")
