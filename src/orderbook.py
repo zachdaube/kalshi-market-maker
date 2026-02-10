@@ -242,9 +242,10 @@ class OrderBook:
 
     def __repr__(self) -> str:
         """String representation of orderbook."""
+        mid_str = f"{self.mid_price:.1f}" if self.mid_price is not None else "N/A"
         return (f"OrderBook({self.ticker}, "
                 f"bid={self.best_bid}¢, ask={self.best_ask}¢, "
-                f"mid={self.mid_price:.1f}¢ if self.mid_price else 'N/A', "
+                f"mid={mid_str}¢, "
                 f"spread={self.spread}¢)")
 
 

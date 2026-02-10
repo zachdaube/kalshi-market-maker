@@ -1,8 +1,10 @@
 # API Keys and Credentials - NEVER COMMIT THESE
 *.pem
 *demo.txt
+*prod.txt
 zachdaube.txt
 kalshidemo.txt
+kalshiprod.txt
 *.key
 credentials.yaml
 .env

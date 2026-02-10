@@ -41,47 +41,87 @@ class KalshiClient:
 
     def get_markets(self,
                     limit: int = 100,
+                    cursor: Optional[str] = None,
                     status: Optional[str] = None,
                     series_ticker: Optional[str] = None,
-                    event_ticker: Optional[str] = None) -> List[Dict[str, Any]]:
+                    event_ticker: Optional[str] = None,
+                    min_close_ts: Optional[int] = None,
+                    max_close_ts: Optional[int] = None) -> tuple:
         """
         Fetch available markets with optional filters.
 
         Args:
-            limit: Maximum number of markets to return
+            limit: Maximum number of markets to return (max 1000)
+            cursor: Pagination cursor from previous response
             status: Filter by status (e.g., "open", "closed")
             series_ticker: Filter by series ticker
             event_ticker: Filter by event ticker
+            min_close_ts: Minimum close timestamp (epoch seconds)
+            max_close_ts: Maximum close timestamp (epoch seconds)
 
         Returns:
-            List of market dictionaries
+            Tuple of (list of market dicts, next_cursor or None)
         """
         try:
-            params = {"limit": limit}
+            params = [f"limit={limit}"]
+            if cursor:
+                params.append(f"cursor={cursor}")
             if status:
-                params["status"] = status
+                params.append(f"status={status}")
             if series_ticker:
-                params["series_ticker"] = series_ticker
+                params.append(f"series_ticker={series_ticker}")
             if event_ticker:
-                params["event_ticker"] = event_ticker
+                params.append(f"event_ticker={event_ticker}")
+            if min_close_ts:
+                params.append(f"min_close_ts={min_close_ts}")
+            if max_close_ts:
+                params.append(f"max_close_ts={max_close_ts}")
 
-            response = self.market_api.get_markets(**params)
+            query = "&".join(params)
+            url = f"{self.host}/markets?{query}"
 
-            # Convert Pydantic models to dictionaries
-            if hasattr(response, 'markets'):
-                markets = []
-                for market in response.markets:
-                    if hasattr(market, 'model_dump'):
-                        markets.append(market.model_dump())
-                    elif hasattr(market, 'dict'):
-                        markets.append(market.dict())
-                    else:
-                        markets.append(market)
-                return markets
-            return []
+            response = self.client.call_api(method="GET", url=url)
+
+            if response and response.status == 200:
+                raw_data = response.read()
+                data = json.loads(raw_data) if isinstance(raw_data, bytes) else raw_data
+                markets = data.get('markets', [])
+                next_cursor = data.get('cursor', None)
+                return markets, next_cursor
+            return [], None
         except Exception as e:
             print(f"Error fetching markets: {e}")
-            return []
+            return [], None
+
+    def get_all_markets(self,
+                        status: Optional[str] = None,
+                        series_ticker: Optional[str] = None,
+                        event_ticker: Optional[str] = None,
+                        min_close_ts: Optional[int] = None,
+                        max_close_ts: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Fetch all markets using cursor-based pagination.
+
+        Returns:
+            Complete list of market dictionaries matching filters
+        """
+        all_markets = []
+        cursor = None
+        while True:
+            markets, next_cursor = self.get_markets(
+                limit=1000,
+                cursor=cursor,
+                status=status,
+                series_ticker=series_ticker,
+                event_ticker=event_ticker,
+                min_close_ts=min_close_ts,
+                max_close_ts=max_close_ts,
+            )
+            all_markets.extend(markets)
+            if not next_cursor or not markets:
+                break
+            cursor = next_cursor
+        return all_markets
 
     def get_market(self, ticker: str) -> Optional[Dict[str, Any]]:
         """
@@ -94,14 +134,15 @@ class KalshiClient:
             Market details dictionary or None if not found
         """
         try:
-            response = self.market_api.get_market(ticker=ticker)
-            if hasattr(response, 'market'):
-                market = response.market
-                if hasattr(market, 'model_dump'):
-                    return market.model_dump()
-                elif hasattr(market, 'dict'):
-                    return market.dict()
-                return market
+            url = f"{self.host}/markets/{ticker}"
+
+            # Make raw API call to bypass SDK validation bugs
+            response = self.client.call_api(method="GET", url=url)
+
+            if response and response.status == 200:
+                raw_data = response.read()
+                data = json.loads(raw_data) if isinstance(raw_data, bytes) else raw_data
+                return data.get('market')
             return None
         except Exception as e:
             print(f"Error fetching market {ticker}: {e}")
@@ -236,27 +277,41 @@ class KalshiClient:
             Order confirmation dictionary or None if failed
         """
         try:
-            params = {
-                "ticker": ticker,
-                "client_order_id": client_order_id or f"{ticker}_{side}_{action}_{price}_{uuid.uuid4().hex[:8]}",
-                "side": side,
-                "action": action,
-                "count": quantity,
-                "type": order_type,
-            }
+            coid = client_order_id or f"{ticker}_{side}_{action}_{price}_{uuid.uuid4().hex[:8]}"
+            yes_p = price if side == "yes" else None
+            no_p = price if side == "no" else None
 
-            if order_type == "limit":
-                params["yes_price"] = price if side == "yes" else None
-                params["no_price"] = price if side == "no" else None
+            print(f"[DEBUG] place_order: ticker={ticker}, side={side}, action={action}, count={quantity}, yes_price={yes_p}, no_price={no_p}")
 
-            response = self.orders_api.create_order(**params)
+            response = self.orders_api.create_order(
+                ticker=ticker,
+                client_order_id=coid,
+                side=side,
+                action=action,
+                count=quantity,
+                type=order_type,
+                yes_price=yes_p,
+                no_price=no_p
+            )
+
             if hasattr(response, 'order'):
                 order = response.order
                 if hasattr(order, 'model_dump'):
                     return order.model_dump()
                 elif hasattr(order, 'dict'):
                     return order.dict()
-                return order
+                elif hasattr(order, 'order_id'):
+                    # Convert Pydantic model to dict manually
+                    return {
+                        'order_id': order.order_id,
+                        'ticker': order.ticker,
+                        'side': order.side,
+                        'action': order.action,
+                        'status': str(order.status.value) if hasattr(order.status, 'value') else str(order.status),
+                        'yes_price': order.yes_price,
+                        'no_price': order.no_price,
+                        'remaining_count': order.remaining_count,
+                    }
             return None
         except Exception as e:
             print(f"Error placing order: {e}")
@@ -273,8 +328,13 @@ class KalshiClient:
             True if successful, False otherwise
         """
         try:
-            self.orders_api.cancel_order(order_id=order_id)
-            return True
+            url = f"{self.host}/portfolio/orders/{order_id}"
+
+            response = self.client.call_api(method="DELETE", url=url)
+
+            if response and response.status in (200, 204):
+                return True
+            return False
         except Exception as e:
             print(f"Error canceling order {order_id}: {e}")
             return False
@@ -311,21 +371,19 @@ class KalshiClient:
             List of open order dictionaries
         """
         try:
-            params = {}
+            params = ["status=resting"]
             if ticker:
-                params["ticker"] = ticker
+                params.append(f"ticker={ticker}")
 
-            response = self.orders_api.get_orders(**params)
-            if hasattr(response, 'orders'):
-                orders = []
-                for order in response.orders:
-                    if hasattr(order, 'model_dump'):
-                        orders.append(order.model_dump())
-                    elif hasattr(order, 'dict'):
-                        orders.append(order.dict())
-                    else:
-                        orders.append(order)
-                return orders
+            query = "&".join(params)
+            url = f"{self.host}/portfolio/orders?{query}"
+
+            response = self.client.call_api(method="GET", url=url)
+
+            if response and response.status == 200:
+                raw_data = response.read()
+                data = json.loads(raw_data) if isinstance(raw_data, bytes) else raw_data
+                return data.get('orders', [])
             return []
         except Exception as e:
             print(f"Error fetching open orders: {e}")
@@ -339,19 +397,14 @@ class KalshiClient:
             List of position dictionaries
         """
         try:
-            response = self.portfolio_api.get_positions()
+            url = f"{self.host}/portfolio/positions"
 
-            # The response contains market positions
-            if hasattr(response, 'market_positions'):
-                positions = []
-                for pos in response.market_positions:
-                    if hasattr(pos, 'model_dump'):
-                        positions.append(pos.model_dump())
-                    elif hasattr(pos, 'dict'):
-                        positions.append(pos.dict())
-                    else:
-                        positions.append(pos)
-                return positions
+            response = self.client.call_api(method="GET", url=url)
+
+            if response and response.status == 200:
+                raw_data = response.read()
+                data = json.loads(raw_data) if isinstance(raw_data, bytes) else raw_data
+                return data.get('market_positions', [])
             return []
         except Exception as e:
             print(f"Error fetching positions: {e}")
@@ -365,11 +418,18 @@ class KalshiClient:
             Balance dictionary with available balance, etc.
         """
         try:
-            response = self.portfolio_api.get_balance()
-            return {
-                "balance": response.balance if hasattr(response, 'balance') else 0,
-                "portfolio_value": response.portfolio_value if hasattr(response, 'portfolio_value') else 0,
-            }
+            url = f"{self.host}/portfolio/balance"
+
+            response = self.client.call_api(method="GET", url=url)
+
+            if response and response.status == 200:
+                raw_data = response.read()
+                data = json.loads(raw_data) if isinstance(raw_data, bytes) else raw_data
+                return {
+                    "balance": data.get('balance', 0),
+                    "portfolio_value": data.get('portfolio_value', 0),
+                }
+            return None
         except Exception as e:
             print(f"Error fetching balance: {e}")
             return None

@@ -11,6 +11,7 @@ COPY src/ src/
 COPY config/ config/
 COPY run_market_maker.py .
 COPY dashboard.py .
+COPY trading_worker.py .
 
 # Expose dashboard port
 EXPOSE 8080

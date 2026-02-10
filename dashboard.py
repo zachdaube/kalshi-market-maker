@@ -2,7 +2,7 @@
 Kalshi Market Maker Dashboard
 
 Real-time web dashboard for monitoring the trading bot.
-Displays: positions, P&L, orderbook, trades, and bot status.
+Displays: positions, P&L, orderbook, trades, flow analysis, and bot status.
 """
 
 import os
@@ -24,6 +24,7 @@ from src.config_loader import ConfigLoader
 from src.orderbook import OrderBook
 from src.quotes import ASParams, Position, PositionTracker, generate_quote
 from src.execution import MarketConfig, ExecutionConfig, OrderState
+from src.flow import FlowAnalyzer, FlowConfig, parse_kalshi_trades
 
 # Flask app setup
 app = Flask(__name__)
@@ -50,16 +51,30 @@ class DashboardState:
     total_cancels: int = 0
     pnl_cents: float = 0.0
 
+    # Flow data
+    flow_states: Dict[str, dict] = None
+
+    # Balance
+    balance_cents: int = 0
+    portfolio_value_cents: int = 0
+
     # History (last 100 events)
     trade_history: deque = None
     quote_history: deque = None
+
+    # Mid price history for charting (per ticker, last 120 data points)
+    mid_history: Dict[str, deque] = None
+    pnl_history: deque = None
 
     def __post_init__(self):
         self.orderbooks = {}
         self.positions = {}
         self.quotes = {}
+        self.flow_states = {}
         self.trade_history = deque(maxlen=100)
         self.quote_history = deque(maxlen=100)
+        self.mid_history = {}
+        self.pnl_history = deque(maxlen=120)
 
 
 # Global state
@@ -68,6 +83,8 @@ client: Optional[KalshiClient] = None
 config: Optional[ExecutionConfig] = None
 position_tracker = PositionTracker()
 order_states: Dict[str, OrderState] = {}
+flow_analyzer = FlowAnalyzer(FlowConfig())
+flow_cooldowns: Dict[str, float] = {}
 
 
 def emit_state():
@@ -83,11 +100,18 @@ def emit_state():
             'cancels': state.total_cancels,
             'pnl_cents': state.pnl_cents
         },
+        'balance': {
+            'balance_cents': state.balance_cents,
+            'portfolio_value_cents': state.portfolio_value_cents,
+        },
         'positions': state.positions,
         'quotes': state.quotes,
         'orderbooks': state.orderbooks,
+        'flow_states': state.flow_states,
         'trade_history': list(state.trade_history),
         'quote_history': list(state.quote_history),
+        'mid_history': {t: list(h) for t, h in state.mid_history.items()},
+        'pnl_history': list(state.pnl_history),
         'timestamp': datetime.now().isoformat()
     })
 
@@ -108,25 +132,56 @@ def log_event(event_type: str, data: dict):
     socketio.emit('event', event)
 
 
-def trading_loop():
+def trading_loop(key_id: str, private_key: str, host: str):
     """Main trading loop running in background thread."""
     global state, client, config
+
+    from src.client import KalshiClient
+    client = KalshiClient(key_id=key_id, private_key=private_key, host=host)
+    print("[TRADING] Client initialized in trading thread")
 
     state.running = True
     state.start_time = time.time()
     last_sync = 0
+    last_balance_sync = 0
+    loop_count = 0
 
     while state.running:
         try:
+            loop_count += 1
+            if loop_count <= 5 or loop_count % 60 == 0:
+                print(f"[TRADING] Loop {loop_count}, markets: {list(config.markets.keys())}", flush=True)
+
             # Sync positions periodically
             if time.time() - last_sync > config.position_sync_interval:
                 sync_positions()
                 last_sync = time.time()
 
+            # Sync balance every 30s
+            if time.time() - last_balance_sync > 30:
+                sync_balance()
+                last_balance_sync = time.time()
+
+            # Check global position limit
+            total_exposure = position_tracker.get_total_exposure()
+            if total_exposure > config.total_max_position:
+                log_event('error', {'message': f'Position limit exceeded ({total_exposure}/{config.total_max_position}), pulling quotes'})
+                for ticker in list(order_states.keys()):
+                    cancel_orders(ticker)
+                emit_state()
+                time.sleep(config.quote_interval)
+                continue
+
             # Update each market
             for ticker, mc in config.markets.items():
                 if mc.enabled:
                     update_market(ticker, mc)
+
+            # Track PnL history
+            state.pnl_history.append({
+                'time': datetime.now().isoformat(),
+                'pnl': state.pnl_cents
+            })
 
             # Emit state to dashboard
             emit_state()
@@ -151,7 +206,7 @@ def sync_positions():
         for p in api_positions:
             ticker = p.get('ticker')
             qty = p.get('position', 0)
-            avg_price = p.get('average_price_paid', 0)
+            avg_price = p.get('average_price_paid') or p.get('avg_price')
 
             current = position_tracker.get_position(ticker)
             if current.quantity != qty:
@@ -164,15 +219,42 @@ def sync_positions():
                     'delta': delta
                 })
 
-            position_tracker.positions[ticker] = Position(ticker, qty, avg_price if avg_price else None)
+            position_tracker.positions[ticker] = Position(
+                ticker, qty, avg_price if avg_price else current.avg_entry_price
+            )
+
+            # Calculate unrealized PnL
+            pos_obj = position_tracker.get_position(ticker)
+            mid = state.orderbooks.get(ticker, {}).get('mid')
+            unrealized = 0
+            if mid and pos_obj.avg_entry_price and pos_obj.quantity != 0:
+                unrealized = (mid - pos_obj.avg_entry_price) * pos_obj.quantity
+
             state.positions[ticker] = {
                 'quantity': qty,
                 'avg_price': avg_price,
-                'side': 'LONG' if qty > 0 else 'SHORT' if qty < 0 else 'FLAT'
+                'side': 'LONG' if qty > 0 else 'SHORT' if qty < 0 else 'FLAT',
+                'unrealized_pnl': round(unrealized, 1),
             }
+
+        # Update total PnL
+        total_pnl = sum(p.get('unrealized_pnl', 0) for p in state.positions.values())
+        state.pnl_cents = total_pnl
 
     except Exception as e:
         log_event('error', {'message': f'Position sync error: {e}'})
+
+
+def sync_balance():
+    """Sync balance from API."""
+    global state, client
+    try:
+        bal = client.get_balance()
+        if bal:
+            state.balance_cents = bal.get('balance', 0)
+            state.portfolio_value_cents = bal.get('portfolio_value', 0)
+    except Exception as e:
+        log_event('error', {'message': f'Balance sync error: {e}'})
 
 
 def update_market(ticker: str, mc: MarketConfig):
@@ -203,12 +285,69 @@ def update_market(ticker: str, mc: MarketConfig):
         'best_ask': ob.best_ask
     }
 
+    # Track mid price history
+    if ticker not in state.mid_history:
+        state.mid_history[ticker] = deque(maxlen=120)
+    if ob.mid_price is not None:
+        state.mid_history[ticker].append({
+            'time': datetime.now().isoformat(),
+            'mid': ob.mid_price,
+        })
+
     if ob.mid_price is None:
         cancel_orders(ticker)
         return
 
     # Get position
     pos = position_tracker.get_position(ticker)
+
+    # Stop loss check
+    if pos.quantity != 0 and pos.avg_entry_price:
+        pnl = (ob.mid_price - pos.avg_entry_price) * pos.quantity
+        if pnl < -mc.max_loss_cents:
+            log_event('error', {'message': f'Stop loss {ticker}: PnL={pnl:.0f}c (limit={-mc.max_loss_cents}c)'})
+            cancel_orders(ticker)
+            return
+
+    # Flow detection
+    flow_adjustment = flow_analyzer.recommend_adjustment(ticker)
+    try:
+        raw_trades = client.get_trades(ticker, limit=20)
+        if raw_trades:
+            trades = parse_kalshi_trades(raw_trades)
+            flow_analyzer.add_trades(trades)
+            flow_adjustment = flow_analyzer.recommend_adjustment(ticker)
+    except Exception as e:
+        log_event('error', {'message': f'Flow analysis error {ticker}: {e}'})
+
+    # Store flow state for dashboard
+    try:
+        metrics = flow_analyzer.analyze(ticker)
+        state.flow_states[ticker] = {
+            'toxicity': metrics.toxicity_score if metrics else 0,
+            'action': flow_adjustment.action,
+            'reason': flow_adjustment.reason,
+            'spread_mult': flow_adjustment.spread_multiplier,
+            'size_mult': flow_adjustment.size_multiplier,
+            'max_run': metrics.max_run_length if metrics else 0,
+            'imbalance': round(metrics.buy_sell_imbalance, 2) if metrics else 0.5,
+            'momentum': round(metrics.price_momentum, 1) if metrics else 0,
+        }
+    except Exception:
+        state.flow_states[ticker] = {
+            'toxicity': 0, 'action': 'normal', 'reason': '',
+            'spread_mult': 1.0, 'size_mult': 1.0,
+            'max_run': 0, 'imbalance': 0.5, 'momentum': 0,
+        }
+
+    if flow_adjustment.action == "pull":
+        log_event('error', {'message': f'Flow PULL {ticker}: {flow_adjustment.reason}'})
+        cancel_orders(ticker)
+        flow_cooldowns[ticker] = time.time() + flow_adjustment.cooldown_seconds
+        return
+
+    if time.time() < flow_cooldowns.get(ticker, 0):
+        return
 
     # Generate quote using AS model
     params = ASParams(
@@ -224,6 +363,25 @@ def update_market(ticker: str, mc: MarketConfig):
         cancel_orders(ticker)
         return
 
+    # Apply flow adjustments (widen spread, reduce size)
+    if flow_adjustment.spread_multiplier != 1.0 or flow_adjustment.size_multiplier != 1.0:
+        mid = quote.reservation_price
+        half_spread = (quote.ask.price_cents - quote.bid.price_cents) / 2.0
+        new_half = half_spread * flow_adjustment.spread_multiplier
+        new_bid = max(1, min(98, int(round(mid - new_half))))
+        new_ask = max(2, min(99, int(round(mid + new_half))))
+        if new_bid >= new_ask:
+            new_bid = max(1, int(mid) - 1)
+            new_ask = min(99, int(mid) + 1)
+        if new_bid >= new_ask:
+            cancel_orders(ticker)
+            return
+        quote.bid.price_cents = new_bid
+        quote.ask.price_cents = new_ask
+        quote.spread_cents = new_ask - new_bid
+        quote.bid.quantity = max(1, int(quote.bid.quantity * flow_adjustment.size_multiplier))
+        quote.ask.quantity = max(1, int(quote.ask.quantity * flow_adjustment.size_multiplier))
+
     # Store quote for dashboard
     state.quotes[ticker] = {
         'bid_price': quote.bid.price_cents,
@@ -231,7 +389,9 @@ def update_market(ticker: str, mc: MarketConfig):
         'ask_price': quote.ask.price_cents,
         'ask_qty': quote.ask.quantity,
         'reservation_price': quote.reservation_price,
-        'spread': quote.ask.price_cents - quote.bid.price_cents
+        'mid_price': quote.mid_price,
+        'spread': quote.ask.price_cents - quote.bid.price_cents,
+        'inventory': pos.quantity,
     }
 
     # Check if we need to update orders
@@ -258,6 +418,7 @@ def place_orders(ticker: str, quote, os_state: OrderState):
         'bid_qty': quote.bid.quantity,
         'ask_qty': quote.ask.quantity,
         'reservation': round(quote.reservation_price, 1),
+        'spread': quote.ask.price_cents - quote.bid.price_cents,
         'dry_run': config.dry_run
     })
 
@@ -325,381 +486,906 @@ def cancel_orders(ticker: str):
     os_state.no_order_id = None
 
 
-# Dashboard HTML template
+# ==================== Dashboard HTML ====================
+
 DASHBOARD_HTML = '''
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Kalshi Market Maker Dashboard</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kalshi Market Maker</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'SF Mono', 'Consolas', monospace;
-            background: #0d1117;
-            color: #c9d1d9;
-            padding: 20px;
+        :root {
+            --bg-primary: #0a0e17;
+            --bg-secondary: #111827;
+            --bg-card: #1a1f2e;
+            --bg-hover: #252b3b;
+            --border: #2a3040;
+            --border-light: #374151;
+            --text-primary: #e5e7eb;
+            --text-secondary: #9ca3af;
+            --text-muted: #6b7280;
+            --accent-blue: #3b82f6;
+            --accent-cyan: #22d3ee;
+            --accent-green: #10b981;
+            --accent-red: #ef4444;
+            --accent-yellow: #f59e0b;
+            --accent-purple: #8b5cf6;
+            --green-dim: rgba(16, 185, 129, 0.12);
+            --red-dim: rgba(239, 68, 68, 0.12);
+            --blue-dim: rgba(59, 130, 246, 0.12);
         }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.5;
+            overflow-x: hidden;
+        }
+
+        /* ---- Header ---- */
         .header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 20px;
-            padding-bottom: 15px;
-            border-bottom: 1px solid #30363d;
+            padding: 16px 24px;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            position: sticky;
+            top: 0;
+            z-index: 100;
         }
-        .header h1 { color: #58a6ff; font-size: 24px; }
-        .status {
+        .header-left { display: flex; align-items: center; gap: 16px; }
+        .header-left h1 {
+            font-size: 18px;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.3px;
+        }
+        .badges { display: flex; gap: 8px; align-items: center; }
+        .badge {
+            font-size: 11px;
+            font-weight: 600;
+            padding: 3px 10px;
+            border-radius: 100px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .badge-live { background: var(--accent-green); color: #000; }
+        .badge-dry { background: var(--accent-yellow); color: #000; }
+        .badge-stopped { background: var(--accent-red); color: #fff; }
+        .badge-running { background: var(--accent-green); color: #000; }
+        .badge-env {
+            background: var(--bg-card);
+            color: var(--text-secondary);
+            border: 1px solid var(--border);
+        }
+        .header-right {
             display: flex;
-            gap: 20px;
             align-items: center;
-        }
-        .status-badge {
-            padding: 5px 12px;
-            border-radius: 20px;
-            font-size: 12px;
-            font-weight: bold;
-        }
-        .status-running { background: #238636; color: white; }
-        .status-stopped { background: #da3633; color: white; }
-        .status-dry { background: #9e6a03; color: white; }
-
-        .grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
             gap: 20px;
+            font-size: 13px;
+            color: var(--text-secondary);
         }
+        .header-right .uptime { font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 14px; }
+        .pulse {
+            width: 8px; height: 8px; border-radius: 50%;
+            display: inline-block; margin-right: 6px;
+        }
+        .pulse-on { background: var(--accent-green); box-shadow: 0 0 8px var(--accent-green); animation: pulse 2s infinite; }
+        .pulse-off { background: var(--accent-red); }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+        /* ---- Main Grid ---- */
+        .main { padding: 20px 24px; }
+        .grid-top {
+            display: grid;
+            grid-template-columns: repeat(6, 1fr);
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+        .grid-body {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+        .grid-bottom {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 16px;
+        }
+
+        /* ---- Cards ---- */
         .card {
-            background: #161b22;
-            border: 1px solid #30363d;
-            border-radius: 8px;
-            padding: 15px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 16px 20px;
         }
-        .card h2 {
-            color: #58a6ff;
-            font-size: 14px;
-            margin-bottom: 15px;
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 14px;
+        }
+        .card-title {
+            font-size: 12px;
+            font-weight: 600;
             text-transform: uppercase;
             letter-spacing: 1px;
+            color: var(--text-muted);
+        }
+        .card-badge {
+            font-size: 10px;
+            padding: 2px 8px;
+            border-radius: 100px;
+            font-weight: 600;
         }
 
-        /* Stats */
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 15px;
-        }
-        .stat { text-align: center; }
+        /* ---- Stat Cards ---- */
+        .stat-card { text-align: center; padding: 20px 16px; }
         .stat-value {
             font-size: 28px;
-            font-weight: bold;
-            color: #f0f6fc;
+            font-weight: 700;
+            font-family: 'SF Mono', 'Cascadia Code', monospace;
+            margin-bottom: 4px;
+            line-height: 1.2;
         }
         .stat-label {
             font-size: 11px;
-            color: #8b949e;
+            font-weight: 500;
             text-transform: uppercase;
+            letter-spacing: 0.8px;
+            color: var(--text-muted);
         }
-        .stat-positive { color: #3fb950; }
-        .stat-negative { color: #f85149; }
-
-        /* Orderbook */
-        .orderbook { display: flex; gap: 10px; }
-        .orderbook-side { flex: 1; }
-        .orderbook-title {
+        .stat-sub {
             font-size: 11px;
-            color: #8b949e;
-            margin-bottom: 8px;
+            color: var(--text-secondary);
+            margin-top: 4px;
+        }
+        .c-green { color: var(--accent-green); }
+        .c-red { color: var(--accent-red); }
+        .c-blue { color: var(--accent-blue); }
+        .c-yellow { color: var(--accent-yellow); }
+        .c-cyan { color: var(--accent-cyan); }
+        .c-purple { color: var(--accent-purple); }
+        .c-muted { color: var(--text-muted); }
+
+        /* ---- Orderbook ---- */
+        .ob-container { display: flex; flex-direction: column; gap: 6px; }
+        .ob-mid {
+            text-align: center;
+            padding: 8px;
+            background: var(--bg-hover);
+            border-radius: 8px;
+            margin-bottom: 4px;
+        }
+        .ob-mid-price {
+            font-size: 26px;
+            font-weight: 700;
+            font-family: 'SF Mono', 'Cascadia Code', monospace;
+        }
+        .ob-mid-spread { font-size: 12px; color: var(--text-muted); }
+        .ob-side { display: flex; flex-direction: column; gap: 2px; }
+        .ob-header {
+            display: flex;
+            justify-content: space-between;
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-muted);
+            padding: 0 8px;
+            margin-bottom: 4px;
+        }
+        .ob-row {
+            display: flex;
+            align-items: center;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 13px;
+            font-family: 'SF Mono', 'Cascadia Code', monospace;
+            position: relative;
+            overflow: hidden;
+        }
+        .ob-row .depth-bar {
+            position: absolute;
+            top: 0; bottom: 0;
+            border-radius: 4px;
+            z-index: 0;
+            transition: width 0.3s ease;
+        }
+        .ob-row.bid .depth-bar { right: 0; background: var(--green-dim); }
+        .ob-row.ask .depth-bar { right: 0; background: var(--red-dim); }
+        .ob-row > span { position: relative; z-index: 1; }
+        .ob-row .ob-price { flex: 1; font-weight: 600; }
+        .ob-row .ob-qty { width: 60px; text-align: right; color: var(--text-secondary); }
+        .ob-row.bid .ob-price { color: var(--accent-green); }
+        .ob-row.ask .ob-price { color: var(--accent-red); }
+        .ob-row.my-quote {
+            border: 1px solid var(--accent-cyan);
+            background: rgba(34, 211, 238, 0.06);
+        }
+        .ob-row.my-quote .depth-bar { display: none; }
+        .my-tag {
+            font-size: 9px;
+            background: var(--accent-cyan);
+            color: #000;
+            padding: 1px 5px;
+            border-radius: 3px;
+            font-weight: 700;
+            margin-left: 6px;
+        }
+
+        /* ---- Position Card ---- */
+        .pos-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 14px;
+            background: var(--bg-hover);
+            border-radius: 8px;
+            margin-bottom: 6px;
+        }
+        .pos-ticker { font-weight: 600; font-size: 14px; }
+        .pos-details { display: flex; gap: 16px; align-items: center; }
+        .pos-qty { font-family: 'SF Mono', 'Cascadia Code', monospace; font-weight: 600; font-size: 15px; }
+        .pos-meta { font-size: 12px; color: var(--text-secondary); }
+        .pos-pnl { font-family: 'SF Mono', 'Cascadia Code', monospace; font-weight: 600; }
+
+        /* ---- Inventory Gauge ---- */
+        .inv-gauge {
+            margin-top: 10px;
+            padding: 10px;
+            background: var(--bg-hover);
+            border-radius: 8px;
+        }
+        .inv-gauge-label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+        .inv-bar-track {
+            height: 10px;
+            background: var(--bg-secondary);
+            border-radius: 5px;
+            position: relative;
+            overflow: hidden;
+        }
+        .inv-bar-center {
+            position: absolute;
+            left: 50%; top: 0; bottom: 0;
+            width: 2px;
+            background: var(--border-light);
+        }
+        .inv-bar-fill {
+            position: absolute;
+            top: 0; bottom: 0;
+            border-radius: 5px;
+            transition: all 0.3s ease;
+        }
+
+        /* ---- Quote Card ---- */
+        .quote-visual {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            margin-bottom: 10px;
+            padding: 12px;
+            background: var(--bg-hover);
+            border-radius: 8px;
+        }
+        .qv-section { text-align: center; flex: 1; }
+        .qv-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 2px; }
+        .qv-price {
+            font-size: 22px; font-weight: 700;
+            font-family: 'SF Mono', 'Cascadia Code', monospace;
+        }
+        .qv-qty { font-size: 12px; color: var(--text-secondary); }
+        .qv-arrow { font-size: 18px; color: var(--text-muted); flex-shrink: 0; }
+        .qv-reservation {
+            font-size: 11px;
+            text-align: center;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+
+        /* ---- Flow Card ---- */
+        .flow-gauge { margin-bottom: 12px; }
+        .flow-bar-track {
+            height: 16px;
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            overflow: hidden;
+            position: relative;
+        }
+        .flow-bar-fill {
+            height: 100%;
+            border-radius: 8px;
+            transition: width 0.5s ease, background 0.5s ease;
+        }
+        .flow-thresholds {
+            display: flex;
+            justify-content: space-between;
+            font-size: 10px;
+            color: var(--text-muted);
+            margin-top: 4px;
+            padding: 0 2px;
+        }
+        .flow-metrics {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .flow-metric {
+            text-align: center;
+            padding: 8px;
+            background: var(--bg-hover);
+            border-radius: 6px;
+        }
+        .flow-metric-value {
+            font-size: 16px;
+            font-weight: 600;
+            font-family: 'SF Mono', 'Cascadia Code', monospace;
+        }
+        .flow-metric-label {
+            font-size: 10px;
+            color: var(--text-muted);
             text-transform: uppercase;
         }
-        .orderbook-row {
-            display: flex;
-            justify-content: space-between;
-            padding: 4px 8px;
-            font-size: 13px;
-            border-radius: 3px;
-            margin-bottom: 2px;
-        }
-        .bid-row { background: rgba(46, 160, 67, 0.15); }
-        .ask-row { background: rgba(248, 81, 73, 0.15); }
-        .price { font-weight: bold; }
-        .bid-price { color: #3fb950; }
-        .ask-price { color: #f85149; }
-        .qty { color: #8b949e; }
 
-        /* Positions */
-        .position-row {
+        /* ---- Event Log ---- */
+        .events { max-height: 400px; overflow-y: auto; }
+        .events::-webkit-scrollbar { width: 6px; }
+        .events::-webkit-scrollbar-track { background: transparent; }
+        .events::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+        .evt {
             display: flex;
-            justify-content: space-between;
-            padding: 10px;
-            background: #21262d;
-            border-radius: 5px;
-            margin-bottom: 8px;
-        }
-        .position-ticker { font-weight: bold; color: #f0f6fc; }
-        .position-long { color: #3fb950; }
-        .position-short { color: #f85149; }
-        .position-flat { color: #8b949e; }
-
-        /* Quotes */
-        .quote-row {
-            display: flex;
-            justify-content: space-between;
-            padding: 10px;
-            background: #21262d;
-            border-radius: 5px;
-            margin-bottom: 8px;
-            align-items: center;
-        }
-        .quote-prices {
-            display: flex;
-            gap: 20px;
-        }
-        .quote-bid { color: #3fb950; }
-        .quote-ask { color: #f85149; }
-        .quote-spread { color: #8b949e; font-size: 12px; }
-
-        /* Event log */
-        .events {
-            max-height: 300px;
-            overflow-y: auto;
-        }
-        .event {
-            padding: 8px 10px;
-            border-left: 3px solid #30363d;
-            margin-bottom: 5px;
+            align-items: flex-start;
+            gap: 10px;
+            padding: 8px 12px;
+            border-radius: 6px;
+            margin-bottom: 4px;
             font-size: 12px;
-            background: #21262d;
+            font-family: 'SF Mono', 'Cascadia Code', monospace;
+            background: var(--bg-hover);
+            border-left: 3px solid transparent;
         }
-        .event-quote { border-left-color: #58a6ff; }
-        .event-trade { border-left-color: #3fb950; }
-        .event-error { border-left-color: #f85149; }
-        .event-time { color: #8b949e; margin-right: 10px; }
+        .evt-quote { border-left-color: var(--accent-blue); }
+        .evt-trade { border-left-color: var(--accent-green); }
+        .evt-error { border-left-color: var(--accent-red); }
+        .evt-time { color: var(--text-muted); white-space: nowrap; }
+        .evt-content { flex: 1; }
+        .evt-tag {
+            font-size: 9px;
+            font-weight: 700;
+            padding: 1px 6px;
+            border-radius: 3px;
+            text-transform: uppercase;
+        }
+        .evt-tag-quote { background: var(--blue-dim); color: var(--accent-blue); }
+        .evt-tag-trade { background: var(--green-dim); color: var(--accent-green); }
+        .evt-tag-error { background: var(--red-dim); color: var(--accent-red); }
+        .evt-tag-dry { background: var(--bg-secondary); color: var(--accent-yellow); margin-left: 4px; }
 
-        /* Controls */
-        .controls { display: flex; gap: 10px; }
-        .btn {
-            padding: 8px 16px;
-            border: none;
-            border-radius: 5px;
+        /* ---- Market Tabs ---- */
+        .market-tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 16px;
+        }
+        .market-tab {
+            padding: 6px 16px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 600;
             cursor: pointer;
-            font-family: inherit;
-            font-size: 13px;
-            font-weight: bold;
+            background: var(--bg-hover);
+            color: var(--text-secondary);
+            border: 1px solid transparent;
+            transition: all 0.2s;
         }
-        .btn-start { background: #238636; color: white; }
-        .btn-stop { background: #da3633; color: white; }
-        .btn:hover { opacity: 0.9; }
+        .market-tab:hover { color: var(--text-primary); }
+        .market-tab.active {
+            background: var(--blue-dim);
+            color: var(--accent-blue);
+            border-color: var(--accent-blue);
+        }
 
-        .mid-price {
+        /* ---- AS Model Card ---- */
+        .as-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+        .as-item {
+            padding: 8px 10px;
+            background: var(--bg-hover);
+            border-radius: 6px;
+        }
+        .as-item-label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; }
+        .as-item-value {
+            font-size: 15px;
+            font-weight: 600;
+            font-family: 'SF Mono', 'Cascadia Code', monospace;
+        }
+
+        .empty-state {
             text-align: center;
-            padding: 10px;
-            background: #21262d;
-            border-radius: 5px;
-            margin-bottom: 10px;
+            padding: 30px 20px;
+            color: var(--text-muted);
+            font-size: 13px;
         }
-        .mid-value { font-size: 24px; font-weight: bold; color: #f0f6fc; }
-        .spread-value { font-size: 12px; color: #8b949e; }
 
-        .full-width { grid-column: span 2; }
-
-        @media (max-width: 900px) {
-            .grid { grid-template-columns: 1fr; }
-            .full-width { grid-column: span 1; }
-            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+        /* ---- Responsive ---- */
+        @media (max-width: 1200px) {
+            .grid-top { grid-template-columns: repeat(3, 1fr); }
+            .grid-body { grid-template-columns: 1fr 1fr; }
+            .grid-bottom { grid-template-columns: 1fr; }
+        }
+        @media (max-width: 768px) {
+            .grid-top { grid-template-columns: repeat(2, 1fr); }
+            .grid-body { grid-template-columns: 1fr; }
+            .header { flex-direction: column; gap: 10px; }
         }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>Kalshi Market Maker</h1>
-        <div class="status">
-            <span id="env-badge" class="status-badge">DEMO</span>
-            <span id="mode-badge" class="status-badge status-dry">DRY RUN</span>
-            <span id="status-badge" class="status-badge status-stopped">STOPPED</span>
-            <span id="uptime" style="color: #8b949e; font-size: 13px;">--:--:--</span>
+        <div class="header-left">
+            <h1>KALSHI MARKET MAKER</h1>
+            <div class="badges">
+                <span id="env-badge" class="badge badge-env">DEMO</span>
+                <span id="mode-badge" class="badge badge-dry">DRY RUN</span>
+                <span id="status-badge" class="badge badge-stopped">
+                    <span class="pulse pulse-off" id="status-pulse"></span>STOPPED
+                </span>
+            </div>
+        </div>
+        <div class="header-right">
+            <span id="balance-display" style="color:var(--accent-cyan)">--</span>
+            <span>Uptime: <span class="uptime" id="uptime">00:00:00</span></span>
         </div>
     </div>
 
-    <div class="grid">
-        <!-- Stats -->
-        <div class="card full-width">
-            <h2>Statistics</h2>
-            <div class="stats-grid">
-                <div class="stat">
-                    <div class="stat-value" id="stat-quotes">0</div>
-                    <div class="stat-label">Quotes</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-value" id="stat-fills">0</div>
-                    <div class="stat-label">Fills</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-value" id="stat-cancels">0</div>
-                    <div class="stat-label">Cancels</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-value" id="stat-pnl">$0.00</div>
-                    <div class="stat-label">P&L</div>
-                </div>
+    <div class="main">
+        <!-- Market Tabs -->
+        <div class="market-tabs" id="market-tabs"></div>
+
+        <!-- Stat Cards Row -->
+        <div class="grid-top">
+            <div class="card stat-card">
+                <div class="stat-value c-blue" id="stat-quotes">0</div>
+                <div class="stat-label">Quotes Placed</div>
+            </div>
+            <div class="card stat-card">
+                <div class="stat-value c-green" id="stat-fills">0</div>
+                <div class="stat-label">Fills</div>
+            </div>
+            <div class="card stat-card">
+                <div class="stat-value c-yellow" id="stat-cancels">0</div>
+                <div class="stat-label">Cancels</div>
+            </div>
+            <div class="card stat-card">
+                <div class="stat-value" id="stat-pnl">$0.00</div>
+                <div class="stat-label">Unrealized P&L</div>
+            </div>
+            <div class="card stat-card">
+                <div class="stat-value c-cyan" id="stat-exposure">0</div>
+                <div class="stat-label">Total Exposure</div>
+            </div>
+            <div class="card stat-card">
+                <div class="stat-value c-purple" id="stat-spread">--</div>
+                <div class="stat-label">Active Spread</div>
             </div>
         </div>
 
-        <!-- Orderbook -->
-        <div class="card">
-            <h2>Order Book</h2>
-            <div id="orderbook-container">
-                <div class="mid-price">
-                    <div class="mid-value" id="mid-price">--</div>
-                    <div class="spread-value">Spread: <span id="spread">--</span>c</div>
+        <!-- Main Body Grid -->
+        <div class="grid-body">
+            <!-- Order Book -->
+            <div class="card" id="card-orderbook">
+                <div class="card-header">
+                    <span class="card-title">Order Book</span>
+                    <span class="card-badge" id="ob-ticker" style="background:var(--blue-dim);color:var(--accent-blue)">--</span>
                 </div>
-                <div class="orderbook">
-                    <div class="orderbook-side">
-                        <div class="orderbook-title">Bids</div>
-                        <div id="bids"></div>
+                <div class="ob-container" id="orderbook-container">
+                    <div class="ob-mid">
+                        <div class="ob-mid-price" id="ob-mid">--</div>
+                        <div class="ob-mid-spread">Spread: <span id="ob-spread">--</span>c</div>
                     </div>
-                    <div class="orderbook-side">
-                        <div class="orderbook-title">Asks</div>
-                        <div id="asks"></div>
+                    <div class="ob-header"><span>ASKS</span><span>QTY</span></div>
+                    <div class="ob-side" id="ob-asks"></div>
+                    <div style="height:6px"></div>
+                    <div class="ob-header"><span>BIDS</span><span>QTY</span></div>
+                    <div class="ob-side" id="ob-bids"></div>
+                </div>
+            </div>
+
+            <!-- Positions + Quotes -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Active Quote</span>
+                </div>
+                <div id="quote-display">
+                    <div class="empty-state">Waiting for quotes...</div>
+                </div>
+
+                <div style="margin-top:16px;">
+                    <div class="card-header">
+                        <span class="card-title">Positions</span>
+                    </div>
+                    <div id="positions-display">
+                        <div class="empty-state">No positions</div>
+                    </div>
+                </div>
+
+                <div style="margin-top:16px;">
+                    <div class="card-header">
+                        <span class="card-title">AS Model</span>
+                    </div>
+                    <div class="as-grid" id="as-model-display">
+                        <div class="as-item"><div class="as-item-label">Reservation</div><div class="as-item-value" id="as-reservation">--</div></div>
+                        <div class="as-item"><div class="as-item-label">Mid Price</div><div class="as-item-value" id="as-mid">--</div></div>
+                        <div class="as-item"><div class="as-item-label">Inv Shift</div><div class="as-item-value" id="as-shift">--</div></div>
+                        <div class="as-item"><div class="as-item-label">Spread</div><div class="as-item-value" id="as-spread">--</div></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Flow Analysis -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Flow Analysis</span>
+                    <span class="card-badge" id="flow-action-badge" style="background:var(--green-dim);color:var(--accent-green)">NORMAL</span>
+                </div>
+                <div class="flow-gauge">
+                    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
+                        <span style="font-size:11px;color:var(--text-muted)">Toxicity Score</span>
+                        <span style="font-family:'SF Mono',monospace;font-size:18px;font-weight:700" id="flow-score">0</span>
+                    </div>
+                    <div class="flow-bar-track">
+                        <div class="flow-bar-fill" id="flow-bar" style="width:0%;background:var(--accent-green)"></div>
+                    </div>
+                    <div class="flow-thresholds">
+                        <span>0</span><span>40 reduce</span><span>60 widen</span><span>80 pull</span><span>100</span>
+                    </div>
+                </div>
+                <div class="flow-metrics">
+                    <div class="flow-metric">
+                        <div class="flow-metric-value" id="flow-run">0</div>
+                        <div class="flow-metric-label">Max Run</div>
+                    </div>
+                    <div class="flow-metric">
+                        <div class="flow-metric-value" id="flow-imbalance">0.50</div>
+                        <div class="flow-metric-label">Imbalance</div>
+                    </div>
+                    <div class="flow-metric">
+                        <div class="flow-metric-value" id="flow-momentum">0.0</div>
+                        <div class="flow-metric-label">Momentum</div>
+                    </div>
+                </div>
+
+                <div style="margin-top:16px;">
+                    <div class="card-header">
+                        <span class="card-title">Inventory Gauge</span>
+                    </div>
+                    <div class="inv-gauge" id="inv-gauge">
+                        <div class="inv-gauge-label">
+                            <span>-max</span>
+                            <span id="inv-gauge-value">0 contracts</span>
+                            <span>+max</span>
+                        </div>
+                        <div class="inv-bar-track">
+                            <div class="inv-bar-center"></div>
+                            <div class="inv-bar-fill" id="inv-bar-fill" style="left:50%;width:0%;background:var(--text-muted)"></div>
+                        </div>
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- Positions & Quotes -->
-        <div class="card">
-            <h2>Positions & Quotes</h2>
-            <div id="positions"></div>
-            <div style="margin-top: 15px;">
-                <h2>Active Quotes</h2>
-                <div id="quotes"></div>
+        <!-- Bottom: Event Log + Model Params -->
+        <div class="grid-bottom">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Event Log</span>
+                    <span style="font-size:11px;color:var(--text-muted)" id="event-count">0 events</span>
+                </div>
+                <div class="events" id="events"></div>
             </div>
-        </div>
-
-        <!-- Event Log -->
-        <div class="card full-width">
-            <h2>Event Log</h2>
-            <div class="events" id="events"></div>
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Quote History</span>
+                </div>
+                <div class="events" id="quote-history-log"></div>
+            </div>
         </div>
     </div>
 
     <script>
         const socket = io();
+        let selectedTicker = null;
+        let allTickers = [];
+        let eventCount = 0;
 
-        function formatTime(isoString) {
-            const d = new Date(isoString);
-            return d.toLocaleTimeString();
+        function fmt(n, d=1) { return n != null ? n.toFixed(d) : '--'; }
+        function fmtTime(iso) {
+            const d = new Date(iso);
+            return d.toLocaleTimeString('en-US', {hour12:false, hour:'2-digit', minute:'2-digit', second:'2-digit'});
+        }
+        function fmtUptime(s) {
+            const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+            return [h,m,sec].map(v => String(v).padStart(2,'0')).join(':');
         }
 
-        function formatUptime(seconds) {
-            const h = Math.floor(seconds / 3600);
-            const m = Math.floor((seconds % 3600) / 60);
-            const s = seconds % 60;
-            return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-        }
+        socket.on('state_update', function(d) {
+            // ---- Header ----
+            const badge = (id, text, cls) => {
+                const el = document.getElementById(id);
+                el.textContent = text;
+                el.className = 'badge ' + cls;
+            };
+            badge('env-badge', d.environment.toUpperCase(), 'badge-env');
+            badge('mode-badge', d.dry_run ? 'DRY RUN' : 'LIVE', d.dry_run ? 'badge-dry' : 'badge-live');
 
-        socket.on('state_update', function(data) {
-            // Status badges
-            document.getElementById('status-badge').textContent = data.running ? 'RUNNING' : 'STOPPED';
-            document.getElementById('status-badge').className = 'status-badge ' + (data.running ? 'status-running' : 'status-stopped');
-            document.getElementById('mode-badge').textContent = data.dry_run ? 'DRY RUN' : 'LIVE';
-            document.getElementById('mode-badge').className = 'status-badge ' + (data.dry_run ? 'status-dry' : 'status-running');
-            document.getElementById('env-badge').textContent = data.environment.toUpperCase();
-            document.getElementById('uptime').textContent = formatUptime(data.uptime);
+            const statusEl = document.getElementById('status-badge');
+            const pulseEl = document.getElementById('status-pulse');
+            if (d.running) {
+                statusEl.innerHTML = '<span class="pulse pulse-on"></span>RUNNING';
+                statusEl.className = 'badge badge-running';
+            } else {
+                statusEl.innerHTML = '<span class="pulse pulse-off"></span>STOPPED';
+                statusEl.className = 'badge badge-stopped';
+            }
+            document.getElementById('uptime').textContent = fmtUptime(d.uptime);
 
-            // Stats
-            document.getElementById('stat-quotes').textContent = data.stats.quotes;
-            document.getElementById('stat-fills').textContent = data.stats.fills;
-            document.getElementById('stat-cancels').textContent = data.stats.cancels;
-            const pnl = (data.stats.pnl_cents / 100).toFixed(2);
+            // Balance
+            const balEl = document.getElementById('balance-display');
+            if (d.balance && d.balance.balance_cents > 0) {
+                balEl.textContent = '$' + (d.balance.balance_cents / 100).toFixed(2);
+            }
+
+            // ---- Stats ----
+            document.getElementById('stat-quotes').textContent = d.stats.quotes.toLocaleString();
+            document.getElementById('stat-fills').textContent = d.stats.fills.toLocaleString();
+            document.getElementById('stat-cancels').textContent = d.stats.cancels.toLocaleString();
+
+            const pnlCents = d.stats.pnl_cents;
             const pnlEl = document.getElementById('stat-pnl');
-            pnlEl.textContent = '$' + pnl;
-            pnlEl.className = 'stat-value ' + (data.stats.pnl_cents >= 0 ? 'stat-positive' : 'stat-negative');
+            pnlEl.textContent = (pnlCents >= 0 ? '+' : '') + (pnlCents / 100).toFixed(2) + '$';
+            pnlEl.className = 'stat-value ' + (pnlCents >= 0 ? 'c-green' : 'c-red');
 
-            // Orderbook (first market)
-            const tickers = Object.keys(data.orderbooks);
-            if (tickers.length > 0) {
-                const ticker = tickers[0];
-                const ob = data.orderbooks[ticker];
+            // Exposure
+            let totalExp = 0;
+            for (const pos of Object.values(d.positions)) {
+                totalExp += Math.abs(pos.quantity || 0);
+            }
+            document.getElementById('stat-exposure').textContent = totalExp;
 
-                document.getElementById('mid-price').textContent = ob.mid ? ob.mid.toFixed(0) + 'c' : '--';
-                document.getElementById('spread').textContent = ob.spread ? ob.spread.toFixed(1) : '--';
+            // ---- Market Tabs ----
+            const tickers = Object.keys(d.orderbooks);
+            if (tickers.length > 0 && (allTickers.join() !== tickers.join())) {
+                allTickers = tickers;
+                if (!selectedTicker || !tickers.includes(selectedTicker)) {
+                    selectedTicker = tickers[0];
+                }
+                renderTabs();
+            }
 
-                let bidsHtml = '';
-                (ob.bids || []).slice(0, 8).forEach(b => {
-                    bidsHtml += `<div class="orderbook-row bid-row">
-                        <span class="price bid-price">${b.price}c</span>
-                        <span class="qty">${b.quantity}</span>
-                    </div>`;
-                });
-                document.getElementById('bids').innerHTML = bidsHtml || '<div style="color:#8b949e;padding:10px;">No bids</div>';
+            if (!selectedTicker && tickers.length > 0) {
+                selectedTicker = tickers[0];
+                renderTabs();
+            }
 
+            // ---- Active Spread ----
+            if (selectedTicker && d.quotes[selectedTicker]) {
+                document.getElementById('stat-spread').textContent = d.quotes[selectedTicker].spread + 'c';
+            }
+
+            // ---- Orderbook ----
+            if (selectedTicker && d.orderbooks[selectedTicker]) {
+                const ob = d.orderbooks[selectedTicker];
+                const q = d.quotes[selectedTicker];
+                document.getElementById('ob-ticker').textContent = selectedTicker;
+                document.getElementById('ob-mid').textContent = ob.mid != null ? ob.mid.toFixed(1) + 'c' : '--';
+                document.getElementById('ob-spread').textContent = ob.spread != null ? ob.spread.toFixed(1) : '--';
+
+                // Find max qty for depth bar sizing
+                const allLevels = [...(ob.asks||[]), ...(ob.bids||[])];
+                const maxQty = Math.max(1, ...allLevels.map(l => l.quantity));
+                const myBid = q ? q.bid_price : null;
+                const myAsk = q ? q.ask_price : null;
+
+                // Asks (reversed: highest price on top)
                 let asksHtml = '';
-                (ob.asks || []).slice(0, 8).forEach(a => {
-                    asksHtml += `<div class="orderbook-row ask-row">
-                        <span class="price ask-price">${a.price}c</span>
-                        <span class="qty">${a.quantity}</span>
-                    </div>`;
-                });
-                document.getElementById('asks').innerHTML = asksHtml || '<div style="color:#8b949e;padding:10px;">No asks</div>';
+                const asks = (ob.asks || []).slice(0, 6).reverse();
+                for (const a of asks) {
+                    const isMyQuote = myAsk === a.price;
+                    const barW = (a.quantity / maxQty * 60).toFixed(1);
+                    asksHtml += '<div class="ob-row ask' + (isMyQuote ? ' my-quote' : '') + '">' +
+                        '<div class="depth-bar" style="width:' + barW + '%"></div>' +
+                        '<span class="ob-price">' + a.price + 'c' + (isMyQuote ? '<span class="my-tag">YOU</span>' : '') + '</span>' +
+                        '<span class="ob-qty">' + a.quantity + '</span></div>';
+                }
+                document.getElementById('ob-asks').innerHTML = asksHtml || '<div class="empty-state">No asks</div>';
+
+                // Bids (highest first)
+                let bidsHtml = '';
+                const bids = (ob.bids || []).slice(0, 6);
+                for (const b of bids) {
+                    const isMyQuote = myBid === b.price;
+                    const barW = (b.quantity / maxQty * 60).toFixed(1);
+                    bidsHtml += '<div class="ob-row bid' + (isMyQuote ? ' my-quote' : '') + '">' +
+                        '<div class="depth-bar" style="width:' + barW + '%"></div>' +
+                        '<span class="ob-price">' + b.price + 'c' + (isMyQuote ? '<span class="my-tag">YOU</span>' : '') + '</span>' +
+                        '<span class="ob-qty">' + b.quantity + '</span></div>';
+                }
+                document.getElementById('ob-bids').innerHTML = bidsHtml || '<div class="empty-state">No bids</div>';
             }
 
-            // Positions
+            // ---- Quote Display ----
+            if (selectedTicker && d.quotes[selectedTicker]) {
+                const q = d.quotes[selectedTicker];
+                document.getElementById('quote-display').innerHTML =
+                    '<div class="quote-visual">' +
+                        '<div class="qv-section"><div class="qv-label">Bid</div>' +
+                            '<div class="qv-price c-green">' + q.bid_price + 'c</div>' +
+                            '<div class="qv-qty">' + q.bid_qty + ' contracts</div></div>' +
+                        '<div class="qv-arrow">&larr; ' + q.spread + 'c &rarr;</div>' +
+                        '<div class="qv-section"><div class="qv-label">Ask</div>' +
+                            '<div class="qv-price c-red">' + q.ask_price + 'c</div>' +
+                            '<div class="qv-qty">' + q.ask_qty + ' contracts</div></div>' +
+                    '</div>';
+
+                // AS Model
+                document.getElementById('as-reservation').textContent = fmt(q.reservation_price) + 'c';
+                document.getElementById('as-mid').textContent = fmt(q.mid_price) + 'c';
+                const shift = q.reservation_price - q.mid_price;
+                const shiftEl = document.getElementById('as-shift');
+                shiftEl.textContent = (shift >= 0 ? '+' : '') + fmt(shift) + 'c';
+                shiftEl.className = 'as-item-value ' + (Math.abs(shift) < 0.1 ? 'c-muted' : shift > 0 ? 'c-green' : 'c-red');
+                document.getElementById('as-spread').textContent = q.spread + 'c';
+            } else {
+                document.getElementById('quote-display').innerHTML = '<div class="empty-state">Waiting for quotes...</div>';
+            }
+
+            // ---- Positions ----
             let posHtml = '';
-            for (const [ticker, pos] of Object.entries(data.positions)) {
-                const sideClass = pos.quantity > 0 ? 'position-long' : pos.quantity < 0 ? 'position-short' : 'position-flat';
-                posHtml += `<div class="position-row">
-                    <span class="position-ticker">${ticker}</span>
-                    <span class="${sideClass}">${pos.quantity > 0 ? '+' : ''}${pos.quantity} (${pos.side})</span>
-                </div>`;
+            for (const [ticker, pos] of Object.entries(d.positions)) {
+                if (pos.quantity === 0) continue;
+                const color = pos.quantity > 0 ? 'c-green' : 'c-red';
+                const pnlColor = (pos.unrealized_pnl || 0) >= 0 ? 'c-green' : 'c-red';
+                const pnlSign = (pos.unrealized_pnl || 0) >= 0 ? '+' : '';
+                posHtml += '<div class="pos-row">' +
+                    '<div><div class="pos-ticker">' + ticker + '</div>' +
+                    '<div class="pos-meta">' + pos.side + ' @ ' + (pos.avg_price || '--') + 'c avg</div></div>' +
+                    '<div class="pos-details">' +
+                    '<span class="pos-qty ' + color + '">' + (pos.quantity > 0 ? '+' : '') + pos.quantity + '</span>' +
+                    '<span class="pos-pnl ' + pnlColor + '">' + pnlSign + fmt(pos.unrealized_pnl || 0) + 'c</span>' +
+                    '</div></div>';
             }
-            document.getElementById('positions').innerHTML = posHtml || '<div style="color:#8b949e;padding:10px;">No positions</div>';
+            document.getElementById('positions-display').innerHTML = posHtml || '<div class="empty-state">No positions</div>';
 
-            // Quotes
-            let quotesHtml = '';
-            for (const [ticker, q] of Object.entries(data.quotes)) {
-                quotesHtml += `<div class="quote-row">
-                    <span class="position-ticker">${ticker}</span>
-                    <div class="quote-prices">
-                        <span class="quote-bid">${q.bid_price}c x${q.bid_qty}</span>
-                        <span class="quote-ask">${q.ask_price}c x${q.ask_qty}</span>
-                    </div>
-                    <span class="quote-spread">r=${q.reservation_price.toFixed(1)}</span>
-                </div>`;
+            // ---- Flow Analysis ----
+            if (selectedTicker && d.flow_states[selectedTicker]) {
+                const f = d.flow_states[selectedTicker];
+                const tox = f.toxicity;
+
+                document.getElementById('flow-score').textContent = tox;
+                const bar = document.getElementById('flow-bar');
+                bar.style.width = tox + '%';
+                bar.style.background = tox < 40 ? 'var(--accent-green)' :
+                    tox < 60 ? 'var(--accent-yellow)' :
+                    tox < 80 ? 'var(--accent-red)' : '#dc2626';
+
+                const actionBadge = document.getElementById('flow-action-badge');
+                const actionColors = {
+                    normal: ['var(--green-dim)', 'var(--accent-green)'],
+                    reduce: ['rgba(245,158,11,0.15)', 'var(--accent-yellow)'],
+                    widen: ['var(--red-dim)', 'var(--accent-red)'],
+                    pull: ['#dc2626', '#fff'],
+                };
+                const ac = actionColors[f.action] || actionColors.normal;
+                actionBadge.textContent = f.action.toUpperCase();
+                actionBadge.style.background = ac[0];
+                actionBadge.style.color = ac[1];
+
+                document.getElementById('flow-run').textContent = f.max_run;
+                document.getElementById('flow-imbalance').textContent = f.imbalance.toFixed(2);
+                document.getElementById('flow-momentum').textContent = fmt(f.momentum);
             }
-            document.getElementById('quotes').innerHTML = quotesHtml || '<div style="color:#8b949e;padding:10px;">No quotes</div>';
+
+            // ---- Inventory Gauge ----
+            if (selectedTicker) {
+                const pos = d.positions[selectedTicker];
+                const qty = pos ? pos.quantity : 0;
+                const maxPos = 100; // Default, could come from config
+                const pct = Math.min(Math.abs(qty) / maxPos, 1);
+                const gaugeEl = document.getElementById('inv-bar-fill');
+                const gaugeLabel = document.getElementById('inv-gauge-value');
+                gaugeLabel.textContent = (qty > 0 ? '+' : '') + qty + ' contracts';
+                if (qty >= 0) {
+                    gaugeEl.style.left = '50%';
+                    gaugeEl.style.width = (pct * 50) + '%';
+                    gaugeEl.style.background = 'var(--accent-green)';
+                } else {
+                    gaugeEl.style.left = (50 - pct * 50) + '%';
+                    gaugeEl.style.width = (pct * 50) + '%';
+                    gaugeEl.style.background = 'var(--accent-red)';
+                }
+            }
         });
 
-        socket.on('event', function(event) {
+        // ---- Events ----
+        socket.on('event', function(evt) {
+            eventCount++;
+            document.getElementById('event-count').textContent = eventCount + ' events';
+
             const eventsEl = document.getElementById('events');
-            const eventClass = 'event event-' + event.type;
-            let content = '';
+            const qhEl = document.getElementById('quote-history-log');
+            let tag = '', cls = '', content = '';
 
-            if (event.type === 'quote') {
-                content = `<strong>${event.data.ticker}</strong> Bid: ${event.data.bid}c x${event.data.bid_qty} | Ask: ${event.data.ask}c x${event.data.ask_qty}`;
-                if (event.data.dry_run) content += ' [DRY]';
-            } else if (event.type === 'trade') {
-                content = `<strong>${event.data.ticker}</strong> Position: ${event.data.old_qty} → ${event.data.new_qty} (${event.data.delta > 0 ? '+' : ''}${event.data.delta})`;
-            } else if (event.type === 'error') {
-                content = `<strong>ERROR:</strong> ${event.data.message}`;
+            if (evt.type === 'quote') {
+                tag = '<span class="evt-tag evt-tag-quote">QUOTE</span>';
+                if (evt.data.dry_run) tag += '<span class="evt-tag evt-tag-dry">DRY</span>';
+                cls = 'evt-quote';
+                content = '<strong>' + evt.data.ticker + '</strong> ' +
+                    '<span class="c-green">' + evt.data.bid + 'c</span> x' + evt.data.bid_qty +
+                    ' / <span class="c-red">' + evt.data.ask + 'c</span> x' + evt.data.ask_qty +
+                    ' <span class="c-muted">(r=' + evt.data.reservation + ', sprd=' + evt.data.spread + 'c)</span>';
+
+                qhEl.insertAdjacentHTML('afterbegin',
+                    '<div class="evt ' + cls + '">' +
+                    '<span class="evt-time">' + fmtTime(evt.timestamp) + '</span>' +
+                    '<span class="evt-content">' + content + '</span></div>');
+                while (qhEl.children.length > 30) qhEl.removeChild(qhEl.lastChild);
+
+            } else if (evt.type === 'trade') {
+                tag = '<span class="evt-tag evt-tag-trade">FILL</span>';
+                cls = 'evt-trade';
+                content = '<strong>' + evt.data.ticker + '</strong> Position: ' +
+                    evt.data.old_qty + ' &rarr; ' + evt.data.new_qty +
+                    ' <span class="c-green">(+' + evt.data.delta + ' fills)</span>';
+            } else if (evt.type === 'error') {
+                tag = '<span class="evt-tag evt-tag-error">ERR</span>';
+                cls = 'evt-error';
+                content = evt.data.message;
             }
 
-            const eventHtml = `<div class="${eventClass}">
-                <span class="event-time">${formatTime(event.timestamp)}</span>
-                ${content}
-            </div>`;
+            eventsEl.insertAdjacentHTML('afterbegin',
+                '<div class="evt ' + cls + '">' +
+                '<span class="evt-time">' + fmtTime(evt.timestamp) + '</span>' +
+                tag + ' ' +
+                '<span class="evt-content">' + content + '</span></div>');
 
-            eventsEl.insertAdjacentHTML('afterbegin', eventHtml);
-
-            // Keep only last 50 events in DOM
-            while (eventsEl.children.length > 50) {
-                eventsEl.removeChild(eventsEl.lastChild);
-            }
+            while (eventsEl.children.length > 50) eventsEl.removeChild(eventsEl.lastChild);
         });
 
-        socket.on('connect', function() {
-            console.log('Connected to dashboard');
-        });
+        function renderTabs() {
+            const container = document.getElementById('market-tabs');
+            container.innerHTML = allTickers.map(t =>
+                '<div class="market-tab' + (t === selectedTicker ? ' active' : '') + '" onclick="selectTicker(\'' + t + '\')">' + t + '</div>'
+            ).join('');
+        }
+
+        function selectTicker(t) {
+            selectedTicker = t;
+            renderTabs();
+        }
+
+        socket.on('connect', () => console.log('Connected to dashboard'));
+        socket.on('disconnect', () => console.log('Disconnected'));
     </script>
 </body>
 </html>
@@ -772,16 +1458,23 @@ def run_dashboard(env: str, live: bool, port: int):
         # Read private key from file
         with open(key_file, 'r') as f:
             private_key = f.read()
-        client = KalshiClient(key_id=key_id, private_key=private_key, host=host)
+        # Test client initialization (will be created again in trading thread)
+        test_client = KalshiClient(key_id=key_id, private_key=private_key, host=host)
         print("  Client initialized successfully")
+        client_ready = True
     except Exception as e:
         print(f"  Warning: Could not initialize client: {e}")
         print("  Running in offline mode (dashboard only)")
-        client = None
+        client_ready = False
+        private_key = None
 
-    # Start trading thread if client is available
-    if client:
-        trading_thread = threading.Thread(target=trading_loop, daemon=True)
+    # Start trading thread if credentials are available
+    if client_ready:
+        trading_thread = threading.Thread(
+            target=trading_loop,
+            args=(key_id, private_key, host),
+            daemon=True
+        )
         trading_thread.start()
         print(f"\nTrading bot started")
 

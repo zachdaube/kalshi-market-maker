@@ -20,6 +20,9 @@ from typing import Optional, Dict, Tuple
 from dataclasses import dataclass
 import math
 
+# Kalshi maker fee rate
+MAKER_FEE_RATE = 0.0175
+
 
 @dataclass
 class Position:
@@ -146,10 +149,18 @@ def generate_quote(
     bid_cents = int(round(bid_price))
     ask_cents = int(round(ask_price))
 
-    # Ensure minimum 1 cent spread
-    if bid_cents >= ask_cents:
-        bid_cents = int(reservation) - 1
-        ask_cents = int(reservation) + 1
+    # Fee-aware minimum spread: ensure spread covers round-trip maker fees
+    # Fee per side = MAKER_FEE_RATE * P * (1-P), where P = price/100
+    # Round-trip fee ~= 2 * MAKER_FEE_RATE * mid/100 * (1 - mid/100) * 100 (in cents)
+    mid_decimal = mid_price / 100.0
+    min_spread_cents = math.ceil(2 * MAKER_FEE_RATE * mid_decimal * (1 - mid_decimal) * 100) + 1
+
+    # Ensure minimum spread (at least 1 cent, fee-aware floor)
+    min_spread = max(1, min_spread_cents)
+    if ask_cents - bid_cents < min_spread:
+        half = min_spread / 2.0
+        bid_cents = int(math.floor(reservation - half))
+        ask_cents = int(math.ceil(reservation + half))
 
     # Clamp to valid Kalshi range [1, 99]
     bid_cents = max(1, min(98, bid_cents))

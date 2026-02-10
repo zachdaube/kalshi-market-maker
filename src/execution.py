@@ -16,6 +16,7 @@ import logging
 from src.client import KalshiClient
 from src.orderbook import OrderBook
 from src.quotes import ASParams, Position, PositionTracker, TwoSidedQuote, generate_quote
+from src.flow import FlowAnalyzer, FlowConfig, parse_kalshi_trades
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +58,7 @@ class OrderState:
     no_order_id: Optional[str] = None
     last_quote: Optional[TwoSidedQuote] = None
     last_update: float = 0.0
+    flow_cooldown_until: float = 0.0
 
 
 class ExecutionEngine:
@@ -70,6 +72,7 @@ class ExecutionEngine:
         self.running = False
         self.last_sync = 0.0
         self.stats = {'quotes': 0, 'cancels': 0, 'fills': 0}
+        self.flow_analyzer = FlowAnalyzer(FlowConfig())
         logger.info(f"Engine initialized (dry_run={config.dry_run})")
 
     def start(self):
@@ -119,12 +122,15 @@ class ExecutionEngine:
             for p in api_positions:
                 ticker = p.get('ticker')
                 qty = p.get('position', 0)
+                avg_price = p.get('average_price_paid') or p.get('avg_price')
                 current = self.positions.get_position(ticker)
                 if current.quantity != qty:
                     delta = abs(qty - current.quantity)
                     self.stats['fills'] += delta
                     logger.info(f"Position {ticker}: {current.quantity} -> {qty}")
-                    self.positions.positions[ticker] = Position(ticker, qty)
+                self.positions.positions[ticker] = Position(
+                    ticker, qty, avg_price if avg_price else current.avg_entry_price
+                )
         except Exception as e:
             logger.error(f"Position sync error: {e}")
 
@@ -157,6 +163,27 @@ class ExecutionEngine:
                 self._cancel_orders(ticker)
                 return
 
+        # Flow detection: fetch trades and analyze
+        flow_adjustment = self.flow_analyzer.recommend_adjustment(ticker)
+        try:
+            raw_trades = self.client.get_trades(ticker, limit=20)
+            if raw_trades:
+                trades = parse_kalshi_trades(raw_trades)
+                self.flow_analyzer.add_trades(trades)
+                flow_adjustment = self.flow_analyzer.recommend_adjustment(ticker)
+        except Exception as e:
+            logger.error(f"Flow analysis error {ticker}: {e}")
+
+        # Respect flow cooldown
+        if flow_adjustment.action == "pull":
+            logger.warning(f"Flow PULL {ticker}: {flow_adjustment.reason}")
+            self._cancel_orders(ticker)
+            state.flow_cooldown_until = time.time() + flow_adjustment.cooldown_seconds
+            return
+
+        if time.time() < state.flow_cooldown_until:
+            return
+
         # Generate quote using AS model
         params = ASParams(
             gamma=mc.gamma,
@@ -170,6 +197,27 @@ class ExecutionEngine:
         if not quote:
             self._cancel_orders(ticker)
             return
+
+        # Apply flow adjustments to quote (widen spread, reduce size)
+        if flow_adjustment.spread_multiplier != 1.0 or flow_adjustment.size_multiplier != 1.0:
+            logger.info(f"Flow adjust {ticker}: {flow_adjustment.action} "
+                       f"(spread x{flow_adjustment.spread_multiplier}, size x{flow_adjustment.size_multiplier})")
+            mid = quote.reservation_price
+            half_spread = (quote.ask.price_cents - quote.bid.price_cents) / 2.0
+            new_half = half_spread * flow_adjustment.spread_multiplier
+            new_bid = max(1, min(98, int(round(mid - new_half))))
+            new_ask = max(2, min(99, int(round(mid + new_half))))
+            if new_bid >= new_ask:
+                new_bid = max(1, int(mid) - 1)
+                new_ask = min(99, int(mid) + 1)
+            if new_bid >= new_ask:
+                self._cancel_orders(ticker)
+                return
+            quote.bid.price_cents = new_bid
+            quote.ask.price_cents = new_ask
+            quote.spread_cents = new_ask - new_bid
+            quote.bid.quantity = max(1, int(quote.bid.quantity * flow_adjustment.size_multiplier))
+            quote.ask.quantity = max(1, int(quote.ask.quantity * flow_adjustment.size_multiplier))
 
         # Check if we need to update
         if state.last_quote:
@@ -240,16 +288,26 @@ class ExecutionEngine:
             state.no_order_id = None
             return
 
-        for order_id in [state.yes_order_id, state.no_order_id]:
+        for attr in ['yes_order_id', 'no_order_id']:
+            order_id = getattr(state, attr)
             if order_id:
                 try:
-                    self.client.cancel_order(order_id)
-                    self.stats['cancels'] += 1
+                    success = self.client.cancel_order(order_id)
+                    if success:
+                        setattr(state, attr, None)
+                        self.stats['cancels'] += 1
+                    else:
+                        logger.warning(f"Cancel failed for {order_id}, retrying...")
+                        # Retry once
+                        if self.client.cancel_order(order_id):
+                            setattr(state, attr, None)
+                            self.stats['cancels'] += 1
+                        else:
+                            logger.error(f"Cancel retry failed for {order_id}, clearing anyway")
+                            setattr(state, attr, None)
                 except Exception as e:
-                    logger.error(f"Cancel error: {e}")
-
-        state.yes_order_id = None
-        state.no_order_id = None
+                    logger.error(f"Cancel error {order_id}: {e}")
+                    setattr(state, attr, None)
 
     def _print_stats(self):
         """Print final statistics."""

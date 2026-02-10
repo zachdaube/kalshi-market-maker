@@ -15,7 +15,7 @@ When toxic flow is detected, the market maker should:
 
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import deque
 
 
@@ -188,7 +188,12 @@ class FlowAnalyzer:
 
         # Filter by time window
         if self.config.max_time_seconds:
-            cutoff = datetime.now() - timedelta(seconds=self.config.max_time_seconds)
+            # Use timezone-aware now if trades have timezone info, naive otherwise
+            if trades and trades[0].timestamp.tzinfo is not None:
+                now = datetime.now(timezone.utc)
+            else:
+                now = datetime.now()
+            cutoff = now - timedelta(seconds=self.config.max_time_seconds)
             trades = [t for t in trades if t.timestamp >= cutoff]
 
         if len(trades) < 2:
@@ -474,7 +479,7 @@ def parse_kalshi_trades(raw_trades: List[Dict[str, Any]]) -> List[Trade]:
             if timestamp_str:
                 timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
             else:
-                timestamp = datetime.now()
+                timestamp = datetime.now(timezone.utc)
 
             trade = Trade(
                 ticker=raw.get('ticker', ''),
